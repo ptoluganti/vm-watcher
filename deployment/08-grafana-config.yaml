@@ -68,7 +68,7 @@ data:
       "uid": "vm-overview",
       "title": "VM Watcher - Lifecycle Overview",
       "schemaVersion": 39,
-      "version": 3,
+      "version": 4,
       "refresh": "10s",
       "time": { "from": "now-1h", "to": "now" },
       "panels": [
@@ -120,6 +120,44 @@ data:
           "gridPos": {"h": 6, "w": 24, "x": 0, "y": 12},
           "datasource": {"type": "prometheus", "uid": "prometheus"},
           "targets": [{"expr": "vm_event_queue_depth", "legendFormat": "queue depth", "refId": "A"}]
+        },
+        {
+          "type": "stat",
+          "title": "Filtered Events (total)",
+          "gridPos": {"h": 4, "w": 8, "x": 0, "y": 18},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum(vm_events_filtered_total) or vector(0)", "refId": "A"}]
+        },
+        {
+          "type": "stat",
+          "title": "Idempotency Conflicts (total)",
+          "gridPos": {"h": 4, "w": 8, "x": 8, "y": 18},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum(vm_events_publish_conflicts_total) or vector(0)", "refId": "A"}]
+        },
+        {
+          "type": "stat",
+          "title": "Publish Failures (total)",
+          "gridPos": {"h": 4, "w": 8, "x": 16, "y": 18},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum(vm_events_publish_failures_total) or vector(0)", "refId": "A"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Filter Reasons (per min)",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 22},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum by(reason) (rate(vm_events_filtered_total[2m])) * 60", "legendFormat": "{{reason}}", "refId": "A"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Failures vs Conflicts (per min)",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [
+            {"expr": "sum(rate(vm_events_publish_failures_total[2m])) * 60", "legendFormat": "publish_failures", "refId": "A"},
+            {"expr": "sum(rate(vm_events_publish_conflicts_total[2m])) * 60", "legendFormat": "idempotency_conflicts", "refId": "B"}
+          ]
         }
       ]
     }

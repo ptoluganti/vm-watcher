@@ -1,9 +1,11 @@
 // vm-watcher: watches KubeVirt VirtualMachine resources in specific namespaces
-// and publishes create/update/delete events to Kafka.
+// and publishes create/update/delete events to a configured sink.
 package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -62,6 +64,16 @@ var (
 		Help: "Total number of VM events that failed to publish.",
 	}, []string{"type", "namespace", "name"})
 
+	vmEventsPublishConflictsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vm_events_publish_conflicts_total",
+		Help: "Total number of VM events skipped due to idempotency conflict.",
+	}, []string{"type", "namespace", "name"})
+
+	vmEventsFilteredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "vm_events_filtered_total",
+		Help: "Total number of VM events filtered before enqueueing.",
+	}, []string{"reason", "namespace", "name"})
+
 	vmEventQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "vm_event_queue_depth",
 		Help: "Current number of queued VM events waiting to be published.",
@@ -76,21 +88,22 @@ var (
 // VMEvent is the wire format published to the queue.
 // uid + resourceVersion let consumers dedupe (at-least-once delivery).
 type VMEvent struct {
-	Type            EventType `json:"type"`
-	Namespace       string    `json:"namespace"`
-	Name            string    `json:"name"`
-	UID             string    `json:"uid"`
-	ResourceVersion string    `json:"resourceVersion"`
-	Generation      int64     `json:"generation"`
-	RunStrategy     string    `json:"runStrategy,omitempty"`
-	PrintableStatus string    `json:"status,omitempty"`
-	Timestamp       time.Time `json:"timestamp"`
+	Type             EventType `json:"type"`
+	Namespace        string    `json:"namespace"`
+	Name             string    `json:"name"`
+	UID              string    `json:"uid"`
+	ResourceVersion  string    `json:"resourceVersion"`
+	Generation       int64     `json:"generation"`
+	RunStrategy      string    `json:"runStrategy,omitempty"`
+	PrintableStatus  string    `json:"status,omitempty"`
+	EventFingerprint string    `json:"eventFingerprint"`
+	Timestamp        time.Time `json:"timestamp"`
 }
 
 // Publisher abstracts the message queue so Kafka can be swapped for
 // RabbitMQ / Azure Service Bus / Pub-Sub without touching watch logic.
 type Publisher interface {
-	Publish(ctx context.Context, key string, payload []byte) error
+	Publish(ctx context.Context, key, fingerprint string, payload []byte) (bool, error)
 	Close() error
 }
 
@@ -106,8 +119,11 @@ func newKafkaPublisher(brokers []string, topic string) *kafkaPublisher {
 	}}
 }
 
-func (p *kafkaPublisher) Publish(ctx context.Context, key string, payload []byte) error {
-	return p.w.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload})
+func (p *kafkaPublisher) Publish(ctx context.Context, key, _ string, payload []byte) (bool, error) {
+	if err := p.w.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload}); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 func (p *kafkaPublisher) Close() error { return p.w.Close() }
 
@@ -122,6 +138,7 @@ func newPostgresPublisher(ctx context.Context, dsn string) (*postgresPublisher, 
 		CREATE TABLE IF NOT EXISTS vm_events (
 			id               BIGSERIAL    PRIMARY KEY,
 			event_key        TEXT         NOT NULL,
+			event_fingerprint TEXT        NOT NULL,
 			payload          JSONB        NOT NULL,
 			created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 		)`)
@@ -129,14 +146,29 @@ func newPostgresPublisher(ctx context.Context, dsn string) (*postgresPublisher, 
 		pool.Close()
 		return nil, fmt.Errorf("create table: %w", err)
 	}
+	_, err = pool.Exec(ctx, `ALTER TABLE vm_events ADD COLUMN IF NOT EXISTS event_fingerprint TEXT`)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("add fingerprint column: %w", err)
+	}
+	_, err = pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS ux_vm_events_fingerprint ON vm_events(event_fingerprint)`)
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("create fingerprint index: %w", err)
+	}
 	return &postgresPublisher{pool: pool}, nil
 }
 
-func (p *postgresPublisher) Publish(ctx context.Context, key string, payload []byte) error {
-	_, err := p.pool.Exec(ctx,
-		`INSERT INTO vm_events (event_key, payload) VALUES ($1, $2)`,
-		key, payload)
-	return err
+func (p *postgresPublisher) Publish(ctx context.Context, key, fingerprint string, payload []byte) (bool, error) {
+	cmd, err := p.pool.Exec(ctx,
+		`INSERT INTO vm_events (event_key, event_fingerprint, payload)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (event_fingerprint) DO NOTHING`,
+		key, fingerprint, payload)
+	if err != nil {
+		return false, err
+	}
+	return cmd.RowsAffected() == 1, nil
 }
 func (p *postgresPublisher) Close() error { p.pool.Close(); return nil }
 
@@ -155,6 +187,11 @@ func (c *controller) handlers() cache.ResourceEventHandler {
 			oldU, newU := oldObj.(*unstructured.Unstructured), newObj.(*unstructured.Unstructured)
 			// Informer resyncs re-deliver identical objects; drop them.
 			if oldU.GetResourceVersion() == newU.GetResourceVersion() {
+				vmEventsFilteredTotal.WithLabelValues("same_resource_version", newU.GetNamespace(), newU.GetName()).Inc()
+				return
+			}
+			if significantState(oldU) == significantState(newU) {
+				vmEventsFilteredTotal.WithLabelValues("insignificant_modified", newU.GetNamespace(), newU.GetName()).Inc()
 				return
 			}
 			c.enqueue(EventUpdated, newObj)
@@ -177,8 +214,8 @@ func (c *controller) enqueue(t EventType, obj interface{}) {
 	}
 	runStrategy, _, _ := unstructured.NestedString(u.Object, "spec", "runStrategy")
 	status, _, _ := unstructured.NestedString(u.Object, "status", "printableStatus")
-	vmEventsObservedTotal.WithLabelValues(string(t), u.GetNamespace()).Inc()
-	c.queue.Add(VMEvent{
+	ts := time.Now().UTC()
+	ev := VMEvent{
 		Type:            t,
 		Namespace:       u.GetNamespace(),
 		Name:            u.GetName(),
@@ -187,8 +224,12 @@ func (c *controller) enqueue(t EventType, obj interface{}) {
 		Generation:      u.GetGeneration(),
 		RunStrategy:     runStrategy,
 		PrintableStatus: status,
-		Timestamp:       time.Now().UTC(),
-	})
+		Timestamp:       ts,
+	}
+	ev.EventFingerprint = eventFingerprint(ev)
+
+	vmEventsObservedTotal.WithLabelValues(string(t), u.GetNamespace()).Inc()
+	c.queue.Add(ev)
 	vmEventQueueDepth.Set(float64(c.queue.Len()))
 }
 
@@ -220,7 +261,8 @@ func (c *controller) runWorker(ctx context.Context) {
 			}
 			pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
 			defer cancel()
-			if err := c.publisher.Publish(pubCtx, ev.Namespace+"/"+ev.Name, payload); err != nil {
+			stored, err := c.publisher.Publish(pubCtx, ev.Namespace+"/"+ev.Name, ev.EventFingerprint, payload)
+			if err != nil {
 				c.log.Warn("publish failed, requeueing",
 					"vm", ev.Namespace+"/"+ev.Name, "type", ev.Type,
 					"retries", c.queue.NumRequeues(ev), "err", err)
@@ -231,7 +273,7 @@ func (c *controller) runWorker(ctx context.Context) {
 					return
 				}
 				c.log.Error("max retries exceeded, dropping event", "vm", ev.Namespace+"/"+ev.Name)
-			} else {
+			} else if stored {
 				vmEventsPublishedTotal.WithLabelValues(string(ev.Type), ev.Namespace, ev.Name).Inc()
 				vmLastEventUnixSeconds.WithLabelValues(ev.Namespace, ev.Name, string(ev.Type)).Set(float64(time.Now().UTC().Unix()))
 				c.log.Info("published vm event",
@@ -239,6 +281,12 @@ func (c *controller) runWorker(ctx context.Context) {
 					"type", ev.Type,
 					"generation", ev.Generation,
 					"resourceVersion", ev.ResourceVersion)
+			} else {
+				vmEventsPublishConflictsTotal.WithLabelValues(string(ev.Type), ev.Namespace, ev.Name).Inc()
+				c.log.Debug("event skipped due to fingerprint conflict",
+					"vm", ev.Namespace+"/"+ev.Name,
+					"type", ev.Type,
+					"fingerprint", ev.EventFingerprint)
 			}
 			c.queue.Forget(ev)
 			vmEventQueueDepth.Set(float64(c.queue.Len()))
@@ -284,6 +332,52 @@ func parseWatchNamespaces(v string) (watchAll bool, namespaces []string) {
 	return false, namespaces
 }
 
+func significantState(u *unstructured.Unstructured) string {
+	runStrategy, _, _ := unstructured.NestedString(u.Object, "spec", "runStrategy")
+	printableStatus, _, _ := unstructured.NestedString(u.Object, "status", "printableStatus")
+	phase, _, _ := unstructured.NestedString(u.Object, "status", "phase")
+	nodeName, _, _ := unstructured.NestedString(u.Object, "status", "nodeName")
+	ready := vmReadyCondition(u)
+	return strings.Join([]string{runStrategy, printableStatus, phase, nodeName, ready}, "|")
+}
+
+func vmReadyCondition(u *unstructured.Unstructured) string {
+	conds, found, err := unstructured.NestedSlice(u.Object, "status", "conditions")
+	if !found || err != nil {
+		return ""
+	}
+	for _, c := range conds {
+		m, ok := c.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		typeV, _, _ := unstructured.NestedString(m, "type")
+		if typeV != "Ready" {
+			continue
+		}
+		status, _, _ := unstructured.NestedString(m, "status")
+		return status
+	}
+	return ""
+}
+
+func eventFingerprint(ev VMEvent) string {
+	bucket := ev.Timestamp.UTC().Truncate(time.Second).Format(time.RFC3339)
+	raw := strings.Join([]string{
+		string(ev.Type),
+		ev.Namespace,
+		ev.Name,
+		ev.UID,
+		ev.ResourceVersion,
+		fmt.Sprintf("%d", ev.Generation),
+		ev.RunStrategy,
+		ev.PrintableStatus,
+		bucket,
+	}, "|")
+	sum := sha256.Sum256([]byte(raw))
+	return hex.EncodeToString(sum[:])
+}
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 
@@ -306,7 +400,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	sinkType := getenv("SINK_TYPE", "kafka")
+	sinkType := getenv("SINK_TYPE", "postgres")
 	var pub Publisher
 	switch sinkType {
 	case "postgres":

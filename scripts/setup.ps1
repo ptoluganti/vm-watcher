@@ -223,6 +223,13 @@ foreach ($deploy in "postgres","vm-watcher","prometheus","grafana") {
     Ok "$deploy is ready"
 }
 
+# ── 9a. Ensure vm_events schema supports idempotent inserts ─────────────────
+Step "Applying vm_events schema migration (fingerprint + unique index)"
+$postgresPod = kubectl get pod -n vm-watcher -l app=postgres -o jsonpath="{.items[0].metadata.name}"
+$schemaSql = "CREATE TABLE IF NOT EXISTS vm_events (id BIGSERIAL PRIMARY KEY, event_key TEXT NOT NULL, event_fingerprint TEXT NOT NULL, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); ALTER TABLE vm_events ADD COLUMN IF NOT EXISTS event_fingerprint TEXT; CREATE UNIQUE INDEX IF NOT EXISTS ux_vm_events_fingerprint ON vm_events(event_fingerprint);"
+kubectl exec -n vm-watcher $postgresPod -- psql -U vmwatcher -d vmwatcher -v ON_ERROR_STOP=1 -c $schemaSql
+Ok "vm_events schema migration applied"
+
 # ── 9b. Optional cluster RBAC for all-namespace mode ────────────────────────
 $watchNamespaces = kubectl get deploy vm-watcher -n vm-watcher -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='WATCH_NAMESPACES')].value}"
 if (Is-AllNamespaceWatch -Value $watchNamespaces) {

@@ -224,19 +224,19 @@ kubectl patch vm alpine-testvm -n team-b --type=merge -p '{"spec":{"runStrategy"
 ### Windows VM (DataVolume import flow)
 
 1. Set a valid Windows image URL in `deployment/12-example-windows-datavolume.yaml` (or pass `-WindowsImageUrl`).
-2. Run:
+1. Run:
 
 ```powershell
 .\scripts\setup.ps1 -CreateWindowsExampleVM $true -CreateWindowsDataVolume $true -WindowsImageUrl "https://YOUR_WINDOWS_IMAGE.qcow2"
 ```
 
-3. Wait for import:
+1. Wait for import:
 
 ```powershell
 kubectl get dv -n team-b windows-rootdisk -w
 ```
 
-4. Start VM:
+1. Start VM:
 
 ```powershell
 kubectl patch vm windows-testvm -n team-b --type=merge -p '{"spec":{"runStrategy":"Always"}}'
@@ -260,6 +260,8 @@ kubectl exec -n vm-watcher $pod -- psql -U vmwatcher -d vmwatcher -c "select id,
 - `vm_events_observed_total`
 - `vm_events_published_total`
 - `vm_events_publish_failures_total`
+- `vm_events_publish_conflicts_total`
+- `vm_events_filtered_total`
 - `vm_event_queue_depth`
 - `vm_last_event_unix_seconds`
 
