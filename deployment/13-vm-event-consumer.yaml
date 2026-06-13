@@ -15,6 +15,8 @@ spec:
       labels:
         app: vm-event-consumer
     spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
       serviceAccountName: vm-watcher
       securityContext:
         runAsNonRoot: true

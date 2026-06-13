@@ -15,6 +15,8 @@ spec:
       labels:
         app: prometheus
     spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
       containers:
         - name: prometheus
           image: prom/prometheus:v2.53.2

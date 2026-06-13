@@ -34,6 +34,8 @@ spec:
       networks:
         - name: default
           pod: {}
+      nodeSelector:
+        team: team-a
       volumes:
         - name: rootdisk
           containerDisk:

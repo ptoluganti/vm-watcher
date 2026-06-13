@@ -13,6 +13,8 @@ spec:
     metadata:
       labels: { app: vm-watcher }
     spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
       serviceAccountName: vm-watcher
       securityContext:
         runAsNonRoot: true

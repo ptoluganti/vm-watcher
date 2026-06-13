@@ -146,7 +146,7 @@ kubectl -n kubevirt patch kubevirt kubevirt --type=merge --patch '{"spec":{"conf
 Ok "KubeVirt emulation enabled"
 
 Step "Waiting for KubeVirt to reach phase Deployed"
-Wait-ForKubeVirtPhase -ExpectedPhase "Deployed" -TimeoutSeconds 600
+Wait-ForKubeVirtPhase -ExpectedPhase "Deployed" -TimeoutSeconds 1200
 Ok "KubeVirt is deployed"
 
 Step "Verifying KubeVirt components"

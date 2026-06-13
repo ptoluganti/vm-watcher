@@ -25,6 +25,8 @@ spec:
     metadata:
       labels: { app: postgres }
     spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
       securityContext:
         runAsNonRoot: true
         runAsUser: 999          # postgres uid in the official image

@@ -35,6 +35,8 @@ spec:
       networks:
         - name: default
           pod: {}
+      nodeSelector:
+        team: team-b
       volumes:
         - name: rootdisk
           persistentVolumeClaim:
