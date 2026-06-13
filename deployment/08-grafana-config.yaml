@@ -1,0 +1,269 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-admin
+  namespace: vm-watcher
+type: Opaque
+stringData:
+  username: admin
+  password: admin
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-datasources
+  namespace: vm-watcher
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        type: prometheus
+        uid: prometheus
+        access: proxy
+        url: http://prometheus:9090
+        isDefault: true
+        editable: true
+      - name: PostgreSQL
+        type: postgres
+        uid: postgres
+        access: proxy
+        url: postgres.vm-watcher.svc.cluster.local:5432
+        database: vmwatcher
+        user: vmwatcher
+        secureJsonData:
+          password: changeme
+        jsonData:
+          sslmode: disable
+          postgresVersion: 1600
+        editable: true
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-provider
+  namespace: vm-watcher
+data:
+  dashboardproviders.yaml: |
+    apiVersion: 1
+    providers:
+      - name: vm-watcher-dashboards
+        orgId: 1
+        folder: VM Watcher
+        type: file
+        disableDeletion: false
+        editable: true
+        options:
+          path: /var/lib/grafana/dashboards
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboards
+  namespace: vm-watcher
+data:
+  vm-overview.json: |
+    {
+      "id": null,
+      "uid": "vm-overview",
+      "title": "VM Watcher - Lifecycle Overview",
+      "schemaVersion": 39,
+      "version": 3,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "VMs Created (total)",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum(vm_events_observed_total{type=\"ADDED\"}) or vector(0)", "refId": "A"}]
+        },
+        {
+          "type": "stat",
+          "title": "VM Updates (total)",
+          "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum(vm_events_observed_total{type=\"MODIFIED\"}) or vector(0)", "refId": "A"}]
+        },
+        {
+          "type": "stat",
+          "title": "VM Deletes (total)",
+          "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum(vm_events_observed_total{type=\"DELETED\"}) or vector(0)", "refId": "A"}]
+        },
+        {
+          "type": "stat",
+          "title": "Total Published",
+          "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum(vm_events_published_total) or vector(0)", "refId": "A"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Event Rate by Type (per min)",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum by(type) (rate(vm_events_observed_total[2m])) * 60", "legendFormat": "{{type}}", "refId": "A"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Event Rate by Namespace (per min)",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "sum by(namespace) (rate(vm_events_observed_total[2m])) * 60", "legendFormat": "{{namespace}}", "refId": "A"}]
+        },
+        {
+          "type": "timeseries",
+          "title": "Queue Depth",
+          "gridPos": {"h": 6, "w": 24, "x": 0, "y": 12},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"expr": "vm_event_queue_depth", "legendFormat": "queue depth", "refId": "A"}]
+        }
+      ]
+    }
+  vm-per-vm.json: |
+    {
+      "id": null,
+      "uid": "vm-per-vm",
+      "title": "VM Watcher - Per Namespace Changes",
+      "schemaVersion": 39,
+      "version": 3,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "templating": {
+        "list": [
+          {
+            "name": "namespace",
+            "type": "query",
+            "datasource": {"type": "prometheus", "uid": "prometheus"},
+            "query": "label_values(vm_events_observed_total, namespace)",
+            "multi": true,
+            "includeAll": true,
+            "refresh": 1,
+            "label": "Namespace"
+          }
+        ]
+      },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Event Rate by Namespace and Type (per min)",
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [
+            {
+              "expr": "sum by(namespace, type) (rate(vm_events_observed_total{namespace=~\"$namespace\"}[2m])) * 60",
+              "legendFormat": "{{namespace}} / {{type}}",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Total Event Counts by Namespace and Type",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [
+            {
+              "expr": "sum by(namespace, type) (vm_events_observed_total{namespace=~\"$namespace\"})",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Last Event Time by Namespace and Type",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [
+            {
+              "expr": "vm_last_event_unix_seconds{namespace=~\"$namespace\"}",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        }
+      ]
+    }
+  vm-postgres.json: |
+    {
+      "id": null,
+      "uid": "vm-postgres",
+      "title": "VM Watcher - PostgreSQL Events",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "Events per Minute",
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 0},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT $__timeGroupAlias(created_at,'1m'), count(*) AS \"events\" FROM vm_events WHERE $__timeFilter(created_at) GROUP BY 1 ORDER BY 1",
+              "format": "time_series",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "barchart",
+          "title": "Events by Namespace",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT split_part(event_key,'/',1) AS namespace, count(*) AS events FROM vm_events WHERE $__timeFilter(created_at) GROUP BY 1 ORDER BY 2 DESC",
+              "format": "table",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "barchart",
+          "title": "Events by Type",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT payload->>'type' AS event_type, count(*) AS events FROM vm_events WHERE $__timeFilter(created_at) GROUP BY 1 ORDER BY 2 DESC",
+              "format": "table",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Latest VM Events",
+          "gridPos": {"h": 12, "w": 24, "x": 0, "y": 16},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT id, event_key, payload->>'type' AS type, payload->>'status' AS status, created_at FROM vm_events WHERE $__timeFilter(created_at) ORDER BY id DESC LIMIT 100",
+              "format": "table",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Last Seen Status per VM",
+          "gridPos": {"h": 8, "w": 24, "x": 0, "y": 28},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT DISTINCT ON (event_key) event_key, payload->>'type' AS last_event_type, payload->>'status' AS last_status, created_at AS last_seen FROM vm_events ORDER BY event_key, created_at DESC",
+              "format": "table",
+              "refId": "A"
+            }
+          ]
+        }
+      ]
+    }

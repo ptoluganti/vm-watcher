@@ -1,0 +1,23 @@
+# Optional cluster-wide RBAC for all-namespace watch mode.
+# Apply this only when WATCH_NAMESPACES is "*" or "all".
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vm-watcher-cluster
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vm-watcher-cluster
+subjects:
+  - kind: ServiceAccount
+    name: vm-watcher
+    namespace: vm-watcher
+roleRef:
+  kind: ClusterRole
+  name: vm-watcher-cluster
+  apiGroup: rbac.authorization.k8s.io

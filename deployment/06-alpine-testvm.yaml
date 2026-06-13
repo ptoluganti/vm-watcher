@@ -1,0 +1,37 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: alpine-testvm
+  namespace: team-b
+  labels:
+    app: alpine-testvm
+spec:
+  runStrategy: Halted
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: alpine-testvm
+    spec:
+      domain:
+        cpu:
+          cores: 1
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: virtio
+          interfaces:
+            - name: default
+              masquerade: {}
+        machine:
+          type: q35
+        resources:
+          requests:
+            memory: 512Mi
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          containerDisk:
+            image: quay.io/containerdisks/alpine:3.19

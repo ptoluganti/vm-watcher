@@ -1,0 +1,77 @@
+# Namespace-scoped RBAC: repeat the Role+RoleBinding per watched namespace.
+# Deliberately NOT a ClusterRole — least privilege, and the code only does
+# namespaced LIST/WATCH so this is sufficient.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vm-watcher
+  namespace: vm-watcher
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vm-watcher
+  namespace: team-a   # <- one per watched namespace
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines"]   # add "virtualmachineinstances" if needed
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vm-watcher
+  namespace: team-a
+subjects:
+  - kind: ServiceAccount
+    name: vm-watcher
+    namespace: vm-watcher
+roleRef:
+  kind: Role
+  name: vm-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vm-watcher
+  namespace: vm-watcher
+spec:
+  replicas: 1   # >1 without leader election = duplicate events. Keep at 1.
+  selector:
+    matchLabels: { app: vm-watcher }
+  template:
+    metadata:
+      labels: { app: vm-watcher }
+    spec:
+      serviceAccountName: vm-watcher
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: watcher
+          image: registry.example.com/vm-watcher:latest
+          env:
+            - name: WATCH_NAMESPACES
+              value: "team-a,team-b"
+            - name: KAFKA_BROKERS
+              value: "kafka-0.kafka:9092,kafka-1.kafka:9092"
+            - name: KAFKA_TOPIC
+              value: "vm-events"
+            - name: RESYNC_PERIOD
+              value: "10m"
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }

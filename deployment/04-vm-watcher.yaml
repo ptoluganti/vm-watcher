@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vm-watcher
+  namespace: vm-watcher
+  labels:
+    app: vm-watcher
+spec:
+  replicas: 1   # >1 without leader election = duplicate events — keep at 1
+  selector:
+    matchLabels: { app: vm-watcher }
+  template:
+    metadata:
+      labels: { app: vm-watcher }
+    spec:
+      serviceAccountName: vm-watcher
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: watcher
+          image: vm-watcher:dev
+          imagePullPolicy: Never
+          env:
+            # ── namespaces to watch ──────────────────────────────────────────
+            - name: WATCH_NAMESPACES
+              value: "team-a,team-b"   # use "*" or "all" for every namespace
+            # ── sink selection ────────────────────────────────────────────────
+            - name: SINK_TYPE
+              value: "postgres"
+            # ── postgres settings (used when SINK_TYPE=postgres) ─────────────
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: dsn
+            # ── misc ─────────────────────────────────────────────────────────
+            - name: RESYNC_PERIOD
+              value: "10m"
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8080 }
+            initialDelaySeconds: 5
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vm-watcher
+  namespace: vm-watcher
+spec:
+  selector: { app: vm-watcher }
+  ports:
+    - port: 8080
+      targetPort: 8080
+      nodePort: 30080
+  type: NodePort

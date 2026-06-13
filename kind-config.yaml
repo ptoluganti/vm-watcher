@@ -1,0 +1,28 @@
+# kind cluster for local vm-watcher development.
+# Requires: kind >= 0.23, Docker Desktop with nested-virt (for real KubeVirt).
+# For watcher-only dev (no actual VMs), nested-virt is NOT required.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: vm-watcher-dev
+nodes:
+  - role: control-plane
+    # NodePort host-port mappings so you can reach in-cluster services locally.
+    extraPortMappings:
+      - containerPort: 30432   # postgres NodePort -> localhost:5432
+        hostPort: 5432
+        protocol: TCP
+      - containerPort: 30080   # vm-watcher /healthz -> localhost:8080
+        hostPort: 8080
+        protocol: TCP
+      - containerPort: 80     # nginx ingress HTTP -> localhost:80
+        hostPort: 80
+        protocol: TCP
+      - containerPort: 443    # nginx ingress HTTPS -> localhost:443
+        hostPort: 443
+        protocol: TCP
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "ingress-ready=true"

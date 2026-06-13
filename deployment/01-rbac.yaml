@@ -1,0 +1,58 @@
+# ServiceAccount for vm-watcher pods.
+# This file is for explicit namespace-list mode (WATCH_NAMESPACES=ns1,ns2).
+# For all-namespace mode (WATCH_NAMESPACES=* or all), also apply:
+# deployment/01-rbac-cluster.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vm-watcher
+  namespace: vm-watcher
+---
+# Role + RoleBinding pair — repeat per watched namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vm-watcher
+  namespace: team-a
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vm-watcher
+  namespace: team-a
+subjects:
+  - kind: ServiceAccount
+    name: vm-watcher
+    namespace: vm-watcher
+roleRef:
+  kind: Role
+  name: vm-watcher
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vm-watcher
+  namespace: team-b
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vm-watcher
+  namespace: team-b
+subjects:
+  - kind: ServiceAccount
+    name: vm-watcher
+    namespace: vm-watcher
+roleRef:
+  kind: Role
+  name: vm-watcher
+  apiGroup: rbac.authorization.k8s.io
