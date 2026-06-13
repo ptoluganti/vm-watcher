@@ -1,0 +1,23 @@
+# Example CDI DataVolume for importing a Windows disk image.
+# 1) Replace the URL below with your own reachable Windows qcow2/raw image.
+# 2) Apply this file in namespace team-b.
+# 3) Wait until DataVolume phase is Succeeded.
+# 4) Start windows-testvm (it uses PVC windows-rootdisk).
+#
+# NOTE: This requires CDI to be installed in the cluster.
+apiVersion: cdi.kubevirt.io/v1beta1
+kind: DataVolume
+metadata:
+  name: windows-rootdisk
+  namespace: team-b
+spec:
+  source:
+    http:
+      url: https://example.com/path/to/windows-image.qcow2
+  pvc:
+    accessModes:
+      - ReadWriteOnce
+    resources:
+      requests:
+        storage: 40Gi
+    volumeMode: Filesystem

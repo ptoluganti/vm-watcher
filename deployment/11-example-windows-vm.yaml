@@ -1,0 +1,41 @@
+# Example Windows VM for KubeVirt.
+# This sample expects a PVC named "windows-rootdisk" in namespace team-b.
+# You can create that PVC by applying deployment/12-example-windows-datavolume.yaml
+# (requires CDI and a valid Windows image URL).
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: windows-testvm
+  namespace: team-b
+  labels:
+    app: windows-testvm
+spec:
+  runStrategy: Halted
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: windows-testvm
+    spec:
+      domain:
+        cpu:
+          cores: 2
+        machine:
+          type: q35
+        resources:
+          requests:
+            memory: 4Gi
+        devices:
+          disks:
+            - name: rootdisk
+              disk:
+                bus: sata
+          interfaces:
+            - name: default
+              masquerade: {}
+      networks:
+        - name: default
+          pod: {}
+      volumes:
+        - name: rootdisk
+          persistentVolumeClaim:
+            claimName: windows-rootdisk

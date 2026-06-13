@@ -5,6 +5,7 @@
 .DESCRIPTION
     1. Creates (or reuses) a kind cluster from kind-config.yaml
     2. Installs KubeVirt using the kind quickstart flow
+    2b. Optionally installs CDI for DataVolume-based image imports
     3. Builds the vm-watcher Docker image
     4. Loads the image into the kind cluster (no registry needed)
     5. Patches the image reference in the deployment manifest
@@ -20,6 +21,18 @@
 .PARAMETER CreateExampleVM
     Apply deployment/05-example-vm.yaml after the watcher is ready.
 
+.PARAMETER CreateWindowsExampleVM
+    Apply deployment/11-example-windows-vm.yaml (requires a pre-created
+    PVC named windows-rootdisk in namespace team-b).
+
+.PARAMETER CreateWindowsDataVolume
+    Apply deployment/12-example-windows-datavolume.yaml before creating the
+    Windows VM.
+
+.PARAMETER WindowsImageUrl
+    Optional URL replacement for the DataVolume HTTP source.
+    Only used when CreateWindowsDataVolume is true.
+
 .EXAMPLE
     .\scripts\setup.ps1
     .\scripts\setup.ps1 -SinkType postgres
@@ -31,6 +44,12 @@ param(
     [string]$KubevirtVersion = "",
 
     [bool]$CreateExampleVM = $true,
+
+    [bool]$CreateWindowsExampleVM = $false,
+
+    [bool]$CreateWindowsDataVolume = $false,
+
+    [string]$WindowsImageUrl = "",
 
     [string]$ImageTag = "vm-watcher:dev"
 )
@@ -60,6 +79,24 @@ function Wait-ForKubeVirtPhase {
     } while ((Get-Date) -lt $deadline)
 
     Fail "KubeVirt did not reach phase '$ExpectedPhase' within ${TimeoutSeconds}s"
+}
+
+function Wait-ForCdiPhase {
+    param(
+        [string]$ExpectedPhase = "Deployed",
+        [int]$TimeoutSeconds = 300
+    )
+
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    do {
+        $phase = kubectl get cdi.cdi.kubevirt.io/cdi cdi -o jsonpath="{.status.phase}" 2>$null
+        if ($phase -eq $ExpectedPhase) {
+            return
+        }
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $deadline)
+
+    Fail "CDI did not reach phase '$ExpectedPhase' within ${TimeoutSeconds}s"
 }
 
 function Is-AllNamespaceWatch {
@@ -114,6 +151,28 @@ Ok "KubeVirt is deployed"
 
 Step "Verifying KubeVirt components"
 kubectl get all -n kubevirt
+
+# ── 2b. Optionally install CDI for DataVolume imports ───────────────────────
+if ($CreateWindowsDataVolume) {
+    Step "Ensuring CDI is installed for DataVolume import"
+    $dvCrd = kubectl get crd datavolumes.cdi.kubevirt.io --ignore-not-found -o name 2>$null
+    if ([string]::IsNullOrWhiteSpace($dvCrd)) {
+        Step "Installing CDI operator"
+        kubectl apply -f https://github.com/kubevirt/containerized-data-importer/releases/latest/download/cdi-operator.yaml
+        Ok "CDI operator applied"
+
+        Step "Installing CDI custom resource"
+        kubectl apply -f https://github.com/kubevirt/containerized-data-importer/releases/latest/download/cdi-cr.yaml
+        Ok "CDI CR applied"
+    } else {
+        Ok "CDI CRD already present"
+    }
+
+    Step "Waiting for CDI to reach phase Deployed"
+    Wait-ForCdiPhase -ExpectedPhase "Deployed" -TimeoutSeconds 600
+    Ok "CDI is deployed"
+    kubectl get pods -n cdi
+}
 
 # ── 3. Build Docker image ────────────────────────────────────────────────────
 Step "Building Docker image $ImageTag"
@@ -181,6 +240,25 @@ if ($CreateExampleVM) {
     Ok "Example VirtualMachine applied in namespace team-a"
 }
 
+if ($CreateWindowsExampleVM) {
+    if ($CreateWindowsDataVolume) {
+        Step "Applying Windows DataVolume import manifest"
+        $dvFile = "$Root\deployment\12-example-windows-datavolume.yaml"
+        if (-not [string]::IsNullOrWhiteSpace($WindowsImageUrl)) {
+            (Get-Content $dvFile) -replace 'https://example\.com/path/to/windows-image\.qcow2', $WindowsImageUrl |
+                Set-Content $dvFile
+            Ok "Windows image URL injected into DataVolume manifest"
+        }
+        kubectl apply -f $dvFile
+        Ok "Windows DataVolume applied (team-b/windows-rootdisk)"
+    }
+
+    Step "Applying Windows example VirtualMachine manifest"
+    kubectl apply -f "$Root\deployment\11-example-windows-vm.yaml"
+    Ok "Windows example VirtualMachine applied in namespace team-b"
+    Ok "If startup fails, verify PVC/DataVolume team-b/windows-rootdisk exists and is bootable"
+}
+
 Write-Host "`nDone! Cluster summary:" -ForegroundColor Yellow
 kubectl get pods -n vm-watcher
 kubectl get ingress -n vm-watcher
@@ -194,5 +272,10 @@ Write-Host "`nUseful commands:" -ForegroundColor Yellow
 Write-Host "kubectl logs -n vm-watcher deploy/vm-watcher -f" -ForegroundColor Yellow
 Write-Host "kubectl get vm -A" -ForegroundColor Yellow
 Write-Host ".\scripts\inspect-sink.ps1 -SinkType postgres -Tail 20" -ForegroundColor Yellow
+Write-Host "kubectl apply -f deployment/12-example-windows-datavolume.yaml" -ForegroundColor Yellow
+Write-Host "kubectl get dv -n team-b windows-rootdisk -o wide" -ForegroundColor Yellow
+Write-Host "kubectl get cdi cdi -o jsonpath='{.status.phase}'" -ForegroundColor Yellow
+Write-Host "kubectl apply -f deployment/11-example-windows-vm.yaml" -ForegroundColor Yellow
+Write-Host "kubectl patch vm windows-testvm -n team-b --type=merge -p '{\"spec\":{\"runStrategy\":\"Always\"}}'" -ForegroundColor Yellow
 Write-Host "kubectl patch vm fedora-testvm -n team-a --type=merge -p '{\"spec\":{\"runStrategy\":\"Always\"}}'" -ForegroundColor Yellow
 Write-Host "kubectl patch vm fedora-testvm -n team-a --type=merge -p '{\"spec\":{\"runStrategy\":\"Halted\"}}'" -ForegroundColor Yellow
