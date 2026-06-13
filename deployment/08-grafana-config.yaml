@@ -305,3 +305,163 @@ data:
         }
       ]
     }
+  vm-consumer-state.json: |
+    {
+      "id": null,
+      "uid": "vm-consumer-state",
+      "title": "VM Watcher - Consumer State & Anomalies",
+      "schemaVersion": 39,
+      "version": 1,
+      "refresh": "10s",
+      "time": { "from": "now-1h", "to": "now" },
+      "panels": [
+        {
+          "type": "stat",
+          "title": "Total VMs Tracked",
+          "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT count(DISTINCT event_key) AS value FROM vm_state",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Total Anomalies Detected",
+          "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT count(*) AS value FROM vm_state_transitions WHERE anomaly = true",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Consumer Events Processed",
+          "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT count(*) AS value FROM consumer_processed_events",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "stat",
+          "title": "Consumer Lag (events behind)",
+          "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT COALESCE((SELECT MAX(id) FROM vm_events) - MAX(last_event_id), 0) AS value FROM consumer_offsets",
+              "format": "table",
+              "instant": true,
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "timeseries",
+          "title": "VM Status Distribution (Running vs Stopped vs Other)",
+          "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT $__timeGroupAlias(updated_at, '1m'), last_status AS status, count(*) FROM vm_state GROUP BY 1, last_status ORDER BY 1",
+              "format": "time_series",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "timeseries",
+          "title": "Anomaly Count by Type",
+          "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT $__timeGroupAlias(transition_at, '1m'), reason, count(*) FROM vm_state_transitions WHERE anomaly = true GROUP BY 1, reason ORDER BY 1",
+              "format": "time_series",
+              "refId": "A"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "lineWidth": 2
+              }
+            }
+          }
+        },
+        {
+          "type": "barchart",
+          "title": "VMs by Current Status",
+          "gridPos": {"h": 6, "w": 12, "x": 0, "y": 12},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT last_status, count(*) AS count FROM vm_state WHERE last_status IS NOT NULL GROUP BY last_status ORDER BY 2 DESC",
+              "format": "table",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "barchart",
+          "title": "Anomalies by Reason",
+          "gridPos": {"h": 6, "w": 12, "x": 12, "y": 12},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT reason, count(*) AS count FROM vm_state_transitions WHERE anomaly = true GROUP BY reason ORDER BY 2 DESC",
+              "format": "table",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "Recent Anomalous Transitions (last 30)",
+          "gridPos": {"h": 10, "w": 24, "x": 0, "y": 18},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT event_key, from_status, to_status, event_type, event_id, reason, transition_at FROM vm_state_transitions WHERE anomaly = true ORDER BY transition_at DESC LIMIT 30",
+              "format": "table",
+              "refId": "A"
+            }
+          ]
+        },
+        {
+          "type": "table",
+          "title": "All Transitions in Time Range (last 100)",
+          "gridPos": {"h": 10, "w": 24, "x": 0, "y": 28},
+          "datasource": {"type": "postgres", "uid": "postgres"},
+          "targets": [
+            {
+              "rawSql": "SELECT event_key, from_status, to_status, event_type, event_id, anomaly, reason, transition_at FROM vm_state_transitions WHERE $__timeFilter(transition_at) ORDER BY transition_at DESC LIMIT 100",
+              "format": "table",
+              "refId": "A"
+            }
+          ]
+        }
+      ]
+    }

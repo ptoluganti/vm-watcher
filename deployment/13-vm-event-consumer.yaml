@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vm-event-consumer
+  namespace: vm-watcher
+  labels:
+    app: vm-event-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: vm-event-consumer
+  template:
+    metadata:
+      labels:
+        app: vm-event-consumer
+    spec:
+      serviceAccountName: vm-watcher
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: consumer
+          image: vm-event-consumer:dev
+          imagePullPolicy: Never
+          env:
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: dsn
+            - name: CONSUMER_NAME
+              value: vm-event-consumer-1
+            - name: BATCH_SIZE
+              value: "200"
+            - name: POLL_INTERVAL
+              value: "2s"
+            - name: MAX_TRANSITION_GAP
+              value: "30m"
+            - name: INITIAL_BACKOFF
+              value: "1s"
+            - name: MAX_BACKOFF
+              value: "30s"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

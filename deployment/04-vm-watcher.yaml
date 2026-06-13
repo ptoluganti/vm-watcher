@@ -6,7 +6,7 @@ metadata:
   labels:
     app: vm-watcher
 spec:
-  replicas: 1   # >1 without leader election = duplicate events — keep at 1
+  replicas: 1   # safe to scale >1 for postgres sink (idempotent fingerprint + unique index)
   selector:
     matchLabels: { app: vm-watcher }
   template:

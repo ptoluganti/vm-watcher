@@ -273,6 +273,53 @@ Grafana folder: **VM Watcher**
 - VM Watcher - Per Namespace Changes
 - VM Watcher - PostgreSQL Events
 
+## Event consumer (state + transitions + anomaly logic)
+
+This repo now includes a PostgreSQL consumer at `cmd/vm-event-consumer`.
+
+Consumer responsibilities:
+
+- Incremental checkpointing (`consumer_offsets`) so it resumes from the last processed `vm_events.id`
+- Idempotent processing (`consumer_processed_events`) keyed by `event_fingerprint`
+- VM latest-state projection (`vm_state`) for fast "current status" queries
+- Transition history (`vm_state_transitions`) with anomaly flags and reasons
+- Backoff/retry loop for transient database issues
+
+### Build and run locally
+
+```powershell
+go run .\cmd\vm-event-consumer
+```
+
+### Build container and deploy to cluster
+
+```powershell
+docker build -f .\Dockerfile.consumer -t vm-event-consumer:dev .
+kind load docker-image vm-event-consumer:dev --name vm-watcher-dev
+kubectl apply -f .\deployment\13-vm-event-consumer.yaml
+kubectl rollout status deployment/vm-event-consumer -n vm-watcher --timeout=120s
+kubectl logs -n vm-watcher deploy/vm-event-consumer --tail=100
+```
+
+### Useful consumer queries
+
+```sql
+-- last consumed offset per consumer
+select consumer_name, last_event_id, updated_at
+from consumer_offsets;
+
+-- current VM state projection
+select event_key, last_status, last_event_type, last_seen_at, total_events
+from vm_state
+order by updated_at desc;
+
+-- latest transitions and anomalies
+select event_key, from_status, to_status, anomaly, reason, transition_at
+from vm_state_transitions
+order by transition_at desc
+limit 50;
+```
+
 ## Important notes
 
 - This repo is currently Postgres-first for sink usage.

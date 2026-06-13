@@ -174,17 +174,27 @@ if ($CreateWindowsDataVolume) {
     kubectl get pods -n cdi
 }
 
-# ── 3. Build Docker image ────────────────────────────────────────────────────
-Step "Building Docker image $ImageTag"
+# ── 3. Build Docker images (watcher + consumer) ───────────────────────────────
+Step "Building Docker image $ImageTag (vm-watcher)"
 Push-Location $Root
 docker build -t $ImageTag .
 Pop-Location
-Ok "Image built"
+Ok "Watcher image built"
 
-# ── 4. Load image into kind ──────────────────────────────────────────────────
+Step "Building Docker image vm-event-consumer:dev (event consumer)"
+Push-Location $Root
+docker build -f ".\Dockerfile.consumer" -t "vm-event-consumer:dev" .
+Pop-Location
+Ok "Consumer image built"
+
+# ── 4. Load images into kind ─────────────────────────────────────────────────
 Step "Loading $ImageTag into kind cluster"
 kind load docker-image $ImageTag --name vm-watcher-dev
-Ok "Image loaded"
+Ok "Watcher image loaded"
+
+Step "Loading vm-event-consumer:dev into kind cluster"
+kind load docker-image "vm-event-consumer:dev" --name vm-watcher-dev
+Ok "Consumer image loaded"
 
 # ── 5. Patch image in deployment manifest ───────────────────────────────────
 Step "Patching image reference in deployment/04-vm-watcher.yaml"
@@ -216,9 +226,14 @@ Step "Applying manifests via kustomize"
 kubectl apply -k "$Root\deployment"
 Ok "Manifests applied"
 
+# ── 8a. Apply consumer deployment explicitly ────────────────────────────────
+Step "Applying event consumer deployment"
+kubectl apply -f "$Root\deployment\13-vm-event-consumer.yaml"
+Ok "Event consumer deployment applied"
+
 # ── 9. Wait for rollout ───────────────────────────────────────────────────────
 Step "Waiting for deployments to become ready"
-foreach ($deploy in "postgres","vm-watcher","prometheus","grafana") {
+foreach ($deploy in "postgres","vm-watcher","prometheus","grafana","vm-event-consumer") {
     kubectl rollout status deployment/$deploy -n vm-watcher --timeout=120s
     Ok "$deploy is ready"
 }
@@ -275,14 +290,27 @@ Write-Host "`n  Grafana    -> http://grafana.local    (admin / admin)" -Foregrou
 Write-Host "  Prometheus -> http://prometheus.local" -ForegroundColor Green
 Write-Host "  Healthz    -> http://localhost:8080/healthz" -ForegroundColor Green
 Write-Host "  PostgreSQL -> localhost:5432  db=vmwatcher  user=vmwatcher  pass=changeme" -ForegroundColor Green
+Write-Host "`nGrafana Dashboards Available:" -ForegroundColor Yellow
+Write-Host "  - VM Watcher - Lifecycle Overview" -ForegroundColor Green
+Write-Host "  - VM Watcher - Per Namespace Changes" -ForegroundColor Green
+Write-Host "  - VM Watcher - PostgreSQL Events" -ForegroundColor Green
+Write-Host "  - VM Watcher - Consumer State & Anomalies (NEW)" -ForegroundColor Green
 Write-Host "`nUseful commands:" -ForegroundColor Yellow
 Write-Host "kubectl logs -n vm-watcher deploy/vm-watcher -f" -ForegroundColor Yellow
+Write-Host "kubectl logs -n vm-watcher deploy/vm-event-consumer -f" -ForegroundColor Yellow
 Write-Host "kubectl get vm -A" -ForegroundColor Yellow
+Write-Host "kubectl get pods -n vm-watcher -w" -ForegroundColor Yellow
 Write-Host ".\scripts\inspect-sink.ps1 -SinkType postgres -Tail 20" -ForegroundColor Yellow
+Write-Host "`nConsumer state inspection (SQL):" -ForegroundColor Yellow
+Write-Host "# VM state snapshot" -ForegroundColor DarkYellow
+Write-Host "SELECT event_key, last_status, total_events, updated_at FROM vm_state ORDER BY updated_at DESC;" -ForegroundColor DarkYellow
+Write-Host "# Recent anomalies" -ForegroundColor DarkYellow
+Write-Host "SELECT event_key, from_status, to_status, reason FROM vm_state_transitions WHERE anomaly=true ORDER BY transition_at DESC LIMIT 10;" -ForegroundColor DarkYellow
+Write-Host "# Consumer lag" -ForegroundColor DarkYellow
+Write-Host "SELECT (SELECT MAX(id) FROM vm_events) - MAX(last_event_id) AS lag FROM consumer_offsets;" -ForegroundColor DarkYellow
+Write-Host "`nOptional Windows VM setup:" -ForegroundColor Yellow
 Write-Host "kubectl apply -f deployment/12-example-windows-datavolume.yaml" -ForegroundColor Yellow
 Write-Host "kubectl get dv -n team-b windows-rootdisk -o wide" -ForegroundColor Yellow
-Write-Host "kubectl get cdi cdi -o jsonpath='{.status.phase}'" -ForegroundColor Yellow
 Write-Host "kubectl apply -f deployment/11-example-windows-vm.yaml" -ForegroundColor Yellow
 Write-Host "kubectl patch vm windows-testvm -n team-b --type=merge -p '{\"spec\":{\"runStrategy\":\"Always\"}}'" -ForegroundColor Yellow
 Write-Host "kubectl patch vm fedora-testvm -n team-a --type=merge -p '{\"spec\":{\"runStrategy\":\"Always\"}}'" -ForegroundColor Yellow
-Write-Host "kubectl patch vm fedora-testvm -n team-a --type=merge -p '{\"spec\":{\"runStrategy\":\"Halted\"}}'" -ForegroundColor Yellow

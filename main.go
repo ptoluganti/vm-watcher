@@ -88,16 +88,22 @@ var (
 // VMEvent is the wire format published to the queue.
 // uid + resourceVersion let consumers dedupe (at-least-once delivery).
 type VMEvent struct {
-	Type             EventType `json:"type"`
-	Namespace        string    `json:"namespace"`
-	Name             string    `json:"name"`
-	UID              string    `json:"uid"`
-	ResourceVersion  string    `json:"resourceVersion"`
-	Generation       int64     `json:"generation"`
-	RunStrategy      string    `json:"runStrategy,omitempty"`
-	PrintableStatus  string    `json:"status,omitempty"`
-	EventFingerprint string    `json:"eventFingerprint"`
-	Timestamp        time.Time `json:"timestamp"`
+	Type             EventType                `json:"type"`
+	Namespace        string                   `json:"namespace"`
+	Name             string                   `json:"name"`
+	UID              string                   `json:"uid"`
+	ResourceVersion  string                   `json:"resourceVersion"`
+	Generation       int64                    `json:"generation"`
+	RunStrategy      string                   `json:"runStrategy,omitempty"`
+	PrintableStatus  string                   `json:"status,omitempty"`
+	EventFingerprint string                   `json:"eventFingerprint"`
+	Timestamp        time.Time                `json:"timestamp"`
+	Labels           map[string]string        `json:"labels,omitempty"`
+	Annotations      map[string]string        `json:"annotations,omitempty"`
+	OwnerReferences  []map[string]interface{} `json:"ownerReferences,omitempty"`
+	Spec             json.RawMessage          `json:"spec,omitempty"`
+	Status           json.RawMessage          `json:"status,omitempty"`
+	Disks            json.RawMessage          `json:"disks,omitempty"`
 }
 
 // Publisher abstracts the message queue so Kafka can be swapped for
@@ -214,6 +220,66 @@ func (c *controller) enqueue(t EventType, obj interface{}) {
 	}
 	runStrategy, _, _ := unstructured.NestedString(u.Object, "spec", "runStrategy")
 	status, _, _ := unstructured.NestedString(u.Object, "status", "printableStatus")
+
+	// Extract labels
+	labels := u.GetLabels()
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+
+	// Extract annotations
+	annotations := u.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+
+	// Extract owner references
+	var ownerRefs []map[string]interface{}
+	for _, owner := range u.GetOwnerReferences() {
+		ownerRef := map[string]interface{}{
+			"apiVersion": owner.APIVersion,
+			"kind":       owner.Kind,
+			"name":       owner.Name,
+			"uid":        owner.UID,
+			"controller": owner.Controller,
+		}
+		ownerRefs = append(ownerRefs, ownerRef)
+	}
+
+	// Extract full spec
+	var specRaw json.RawMessage
+	if spec, ok := u.Object["spec"]; ok {
+		if specBytes, err := json.Marshal(spec); err == nil {
+			specRaw = specBytes
+		}
+	}
+
+	// Extract full status
+	var statusRaw json.RawMessage
+	if vmStatus, ok := u.Object["status"]; ok {
+		if statusBytes, err := json.Marshal(vmStatus); err == nil {
+			statusRaw = statusBytes
+		}
+	}
+
+	// Extract disks array from spec.template.spec.volumes
+	var disksRaw json.RawMessage
+	if volumes, ok, _ := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "volumes"); ok {
+		var disks []interface{}
+		for _, v := range volumes {
+			vol, _ := v.(map[string]interface{})
+			if vol != nil {
+				// Include all volume info (name, diskSize, source, etc.)
+				disks = append(disks, vol)
+			}
+		}
+		if len(disks) > 0 {
+			if disksBytes, err := json.Marshal(disks); err == nil {
+				disksRaw = disksBytes
+			}
+		}
+	}
+
 	ts := time.Now().UTC()
 	ev := VMEvent{
 		Type:            t,
@@ -225,6 +291,12 @@ func (c *controller) enqueue(t EventType, obj interface{}) {
 		RunStrategy:     runStrategy,
 		PrintableStatus: status,
 		Timestamp:       ts,
+		Labels:          labels,
+		Annotations:     annotations,
+		OwnerReferences: ownerRefs,
+		Spec:            specRaw,
+		Status:          statusRaw,
+		Disks:           disksRaw,
 	}
 	ev.EventFingerprint = eventFingerprint(ev)
 
@@ -362,7 +434,6 @@ func vmReadyCondition(u *unstructured.Unstructured) string {
 }
 
 func eventFingerprint(ev VMEvent) string {
-	bucket := ev.Timestamp.UTC().Truncate(time.Second).Format(time.RFC3339)
 	raw := strings.Join([]string{
 		string(ev.Type),
 		ev.Namespace,
@@ -372,7 +443,6 @@ func eventFingerprint(ev VMEvent) string {
 		fmt.Sprintf("%d", ev.Generation),
 		ev.RunStrategy,
 		ev.PrintableStatus,
-		bucket,
 	}, "|")
 	sum := sha256.Sum256([]byte(raw))
 	return hex.EncodeToString(sum[:])
