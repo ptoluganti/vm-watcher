@@ -27,6 +27,10 @@ spec:
     spec:
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       securityContext:
         runAsNonRoot: true
         runAsUser: 999          # postgres uid in the official image
@@ -50,7 +54,7 @@ spec:
               value: /var/lib/postgresql/data/pgdata
           resources:
             requests: { cpu: 100m, memory: 128Mi }
-            limits:   { memory: 512Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
           readinessProbe:
             exec:
               command: ["pg_isready", "-U", "vmwatcher", "-d", "vmwatcher"]

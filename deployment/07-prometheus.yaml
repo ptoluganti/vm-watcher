@@ -17,6 +17,10 @@ spec:
     spec:
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: prometheus
           image: prom/prometheus:v2.53.2

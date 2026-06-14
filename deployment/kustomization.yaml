@@ -11,4 +11,4 @@ resources:
   - 07-prometheus.yaml
   - 08-grafana-config.yaml
   - 09-grafana.yaml
-  - 10-ingress.yaml
+  - 13-vm-event-consumer.yaml

@@ -226,10 +226,10 @@ Step "Applying manifests via kustomize"
 kubectl apply -k "$Root\deployment"
 Ok "Manifests applied"
 
-# ── 8a. Apply consumer deployment explicitly ────────────────────────────────
-Step "Applying event consumer deployment"
-kubectl apply -f "$Root\deployment\13-vm-event-consumer.yaml"
-Ok "Event consumer deployment applied"
+# ── 8a. Apply ingress resources after controller webhook is ready ───────────
+Step "Applying ingress resources"
+kubectl apply -f "$Root\deployment\10-ingress.yaml"
+Ok "Ingress resources applied"
 
 # ── 9. Wait for rollout ───────────────────────────────────────────────────────
 Step "Waiting for deployments to become ready"

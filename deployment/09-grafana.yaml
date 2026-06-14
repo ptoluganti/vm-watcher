@@ -17,6 +17,10 @@ spec:
     spec:
       nodeSelector:
         node-role.kubernetes.io/control-plane: ""
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule
       containers:
         - name: grafana
           image: grafana/grafana:11.1.4
