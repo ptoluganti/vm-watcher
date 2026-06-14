@@ -1,0 +1,10 @@
+FROM golang:1.22 AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /vm-log-sidecar ./cmd/log-sidecar-publisher
+
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=build /vm-log-sidecar /vm-log-sidecar
+ENTRYPOINT ["/vm-log-sidecar"]

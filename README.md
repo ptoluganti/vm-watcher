@@ -1,11 +1,14 @@
 # vm-watcher
 
-KubeVirt VM event watcher for Kubernetes that publishes VM lifecycle events to PostgreSQL and exposes Prometheus metrics.
+KubeVirt VM event watcher for Kubernetes using a file-first event pipeline: watcher writes rotating JSONL logs, sidecar publishes to PostgreSQL with dedupe, and Prometheus/Grafana provide observability.
 
 ## What this project includes
 
 - Go watcher service (KubeVirt VirtualMachine watch)
-- PostgreSQL sink (`vm_events` table)
+- Rotating event/app log files on mounted storage
+- Sidecar log publisher (`cmd/log-sidecar-publisher`)
+- PostgreSQL sink (`vm_events` table) via sidecar upsert
+- Sidecar checkpoint table (`vm_log_offsets`) for resumable file reads
 - Prometheus metrics endpoint (`/metrics`)
 - Grafana dashboards (Prometheus + PostgreSQL datasources)
 - NGINX ingress routing for local access:
@@ -36,15 +39,41 @@ This will:
 1. Create/reuse kind cluster (`vm-watcher-dev`)
 2. Install KubeVirt
 3. Install ingress-nginx
-4. Build/load `vm-watcher:dev`
-5. Deploy PostgreSQL, vm-watcher, Prometheus, Grafana, and Ingress
+4. Build/load `vm-watcher:dev`, `vm-log-sidecar:dev`, `vm-event-consumer:dev`
+5. Deploy PostgreSQL, vm-watcher (+ sidecar), Prometheus, Grafana, consumer, and Ingress
 6. Apply Fedora example VM (default)
+
+## Design document
+
+### Architecture
+
+This deployment uses a decoupled write path:
+
+1. `vm-watcher` watches KubeVirt `VirtualMachine` resources.
+2. Watcher serializes full event JSON (including spec/status/disks) into rotating JSONL files on shared storage.
+3. `log-publisher-sidecar` reads those files and inserts into PostgreSQL using idempotent SQL.
+4. PostgreSQL enforces global dedupe with unique `event_fingerprint`.
+5. Sidecar persists file offsets in `vm_log_offsets` to avoid full-file rescans.
+
+### Multi-instance behavior
+
+- Multiple watcher replicas are supported.
+- Each watcher writes to a pod-specific file by default: `events-<pod>.jsonl`.
+- Sidecar defaults to reading only its pod file pattern (unless `EVENT_LOG_GLOB` is explicitly widened).
+- Same storage location can be shared across replicas.
+- Duplicate event rows are prevented in PostgreSQL by `ON CONFLICT (event_fingerprint) DO NOTHING`.
+
+### Storage and file-size limits
+
+- App log file rotation: `APP_LOG_MAX_MB`
+- Event log file rotation: `EVENT_LOG_MAX_MB`
+- Mounted storage path: `LOG_DIR` (default `/var/log/vm-watcher`)
 
 ## How watcher works (overview)
 
 The watcher listens for KubeVirt VirtualMachine API events, transforms each event into a JSON payload, and then processes it in two paths:
 
-1. Data path (event persistence): writes each VM event to PostgreSQL table `vm_events`
+1. Data path (event persistence): writes each VM event to rotating JSONL files; sidecar publishes into PostgreSQL table `vm_events`
 2. Observability path (telemetry): updates Prometheus counters/gauges that Grafana dashboards query
 
 ### Event flow diagram
@@ -55,9 +84,11 @@ flowchart LR
   B --> C[KubeVirt VM Resource\nvirtualmachines.kubevirt.io]
   C --> D[vm-watcher informer]
   D --> E[Rate-limited work queue]
-  E --> F[Worker serializer\nJSON payload]
+  E --> F[Watcher serializer\nJSON payload]
 
-  F --> G[(PostgreSQL\nvm_events table)]
+  F --> FS[(Shared log storage\n/events-<pod>.jsonl)]
+  FS --> SC[Sidecar publisher\noffset checkpoint + upsert]
+  SC --> G[(PostgreSQL\nvm_events table)]
   F --> H[Prometheus metrics endpoint\n/metrics]
 
   H --> I[Prometheus scrape job]
@@ -317,6 +348,12 @@ order by updated_at desc;
 select event_key, from_status, to_status, anomaly, reason, transition_at
 from vm_state_transitions
 order by transition_at desc
+limit 50;
+
+-- sidecar offsets (file checkpoint state)
+select publisher_id, file_path, offset, updated_at
+from vm_log_offsets
+order by updated_at desc
 limit 50;
 ```
 

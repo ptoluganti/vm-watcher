@@ -4,6 +4,7 @@ kind: Kustomization
 resources:
   - 00-namespace.yaml
   - 01-rbac.yaml
+  - 03-log-storage.yaml
   - 02-postgres.yaml
   - 04-vm-watcher.yaml
   - 05-example-vm.yaml

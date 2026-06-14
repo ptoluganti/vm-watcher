@@ -32,7 +32,7 @@ type vmEvent struct {
 	Annotations      map[string]string        `json:"annotations,omitempty"`
 	OwnerReferences  []map[string]interface{} `json:"ownerReferences,omitempty"`
 	Spec             json.RawMessage          `json:"spec,omitempty"`
-	Status           json.RawMessage          `json:"status,omitempty"`
+	StatusObject     json.RawMessage          `json:"statusObject,omitempty"`
 	Disks            json.RawMessage          `json:"disks,omitempty"`
 }
 

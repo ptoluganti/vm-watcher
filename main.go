@@ -8,19 +8,21 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"github.com/segmentio/kafka-go"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -102,81 +104,103 @@ type VMEvent struct {
 	Annotations      map[string]string        `json:"annotations,omitempty"`
 	OwnerReferences  []map[string]interface{} `json:"ownerReferences,omitempty"`
 	Spec             json.RawMessage          `json:"spec,omitempty"`
-	Status           json.RawMessage          `json:"status,omitempty"`
+	StatusObject     json.RawMessage          `json:"statusObject,omitempty"`
 	Disks            json.RawMessage          `json:"disks,omitempty"`
 }
 
-// Publisher abstracts the message queue so Kafka can be swapped for
-// RabbitMQ / Azure Service Bus / Pub-Sub without touching watch logic.
+// Publisher abstracts the sink used by the watcher.
 type Publisher interface {
 	Publish(ctx context.Context, key, fingerprint string, payload []byte) (bool, error)
 	Close() error
 }
 
-type kafkaPublisher struct{ w *kafka.Writer }
-
-func newKafkaPublisher(brokers []string, topic string) *kafkaPublisher {
-	return &kafkaPublisher{w: &kafka.Writer{
-		Addr:         kafka.TCP(brokers...),
-		Topic:        topic,
-		Balancer:     &kafka.Hash{}, // key = namespace/name -> per-VM ordering
-		RequiredAcks: kafka.RequireAll,
-		BatchTimeout: 50 * time.Millisecond,
-	}}
+type rotatingFileWriter struct {
+	mu       sync.Mutex
+	path     string
+	maxBytes int64
+	file     *os.File
 }
 
-func (p *kafkaPublisher) Publish(ctx context.Context, key, _ string, payload []byte) (bool, error) {
-	if err := p.w.WriteMessages(ctx, kafka.Message{Key: []byte(key), Value: payload}); err != nil {
+func newRotatingFileWriter(path string, maxMB int) (*rotatingFileWriter, error) {
+	if maxMB <= 0 {
+		maxMB = 100
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	return &rotatingFileWriter{path: path, maxBytes: int64(maxMB) * 1024 * 1024, file: f}, nil
+}
+
+func (w *rotatingFileWriter) rotateIfNeeded(nextWriteLen int) error {
+	st, err := w.file.Stat()
+	if err != nil {
+		return err
+	}
+	if st.Size()+int64(nextWriteLen) <= w.maxBytes {
+		return nil
+	}
+	if err := w.file.Close(); err != nil {
+		return err
+	}
+	rotated := fmt.Sprintf("%s.%d", w.path, time.Now().UTC().UnixNano())
+	if err := os.Rename(w.path, rotated); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	w.file = f
+	return nil
+}
+
+func (w *rotatingFileWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if err := w.rotateIfNeeded(len(p)); err != nil {
+		return 0, err
+	}
+	return w.file.Write(p)
+}
+
+func (w *rotatingFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
+	err := w.file.Close()
+	w.file = nil
+	return err
+}
+
+type filePublisher struct {
+	writer *rotatingFileWriter
+}
+
+func newFilePublisher(path string, maxMB int) (*filePublisher, error) {
+	w, err := newRotatingFileWriter(path, maxMB)
+	if err != nil {
+		return nil, err
+	}
+	return &filePublisher{writer: w}, nil
+}
+
+func (p *filePublisher) Publish(_ context.Context, _, _ string, payload []byte) (bool, error) {
+	line := append(payload, '\n')
+	if _, err := p.writer.Write(line); err != nil {
 		return false, err
 	}
 	return true, nil
 }
-func (p *kafkaPublisher) Close() error { return p.w.Close() }
 
-type postgresPublisher struct{ pool *pgxpool.Pool }
-
-func newPostgresPublisher(ctx context.Context, dsn string) (*postgresPublisher, error) {
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		return nil, fmt.Errorf("connect postgres: %w", err)
-	}
-	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS vm_events (
-			id               BIGSERIAL    PRIMARY KEY,
-			event_key        TEXT         NOT NULL,
-			event_fingerprint TEXT        NOT NULL,
-			payload          JSONB        NOT NULL,
-			created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-		)`)
-	if err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("create table: %w", err)
-	}
-	_, err = pool.Exec(ctx, `ALTER TABLE vm_events ADD COLUMN IF NOT EXISTS event_fingerprint TEXT`)
-	if err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("add fingerprint column: %w", err)
-	}
-	_, err = pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS ux_vm_events_fingerprint ON vm_events(event_fingerprint)`)
-	if err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("create fingerprint index: %w", err)
-	}
-	return &postgresPublisher{pool: pool}, nil
+func (p *filePublisher) Close() error {
+	return p.writer.Close()
 }
-
-func (p *postgresPublisher) Publish(ctx context.Context, key, fingerprint string, payload []byte) (bool, error) {
-	cmd, err := p.pool.Exec(ctx,
-		`INSERT INTO vm_events (event_key, event_fingerprint, payload)
-		 VALUES ($1, $2, $3)
-		 ON CONFLICT (event_fingerprint) DO NOTHING`,
-		key, fingerprint, payload)
-	if err != nil {
-		return false, err
-	}
-	return cmd.RowsAffected() == 1, nil
-}
-func (p *postgresPublisher) Close() error { p.pool.Close(); return nil }
 
 type controller struct {
 	queue     workqueue.RateLimitingInterface
@@ -295,7 +319,7 @@ func (c *controller) enqueue(t EventType, obj interface{}) {
 		Annotations:     annotations,
 		OwnerReferences: ownerRefs,
 		Spec:            specRaw,
-		Status:          statusRaw,
+		StatusObject:    statusRaw,
 		Disks:           disksRaw,
 	}
 	ev.EventFingerprint = eventFingerprint(ev)
@@ -449,11 +473,19 @@ func eventFingerprint(ev VMEvent) string {
 }
 
 func main() {
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	logDir := getenv("LOG_DIR", "/var/log/vm-watcher")
+	podName := getenv("POD_NAME", "vm-watcher")
+	appLogPath := filepath.Join(logDir, getenv("APP_LOG_FILE", "watcher.log"))
+	eventLogPath := filepath.Join(logDir, getenv("EVENT_LOG_FILE", fmt.Sprintf("events-%s.jsonl", podName)))
+	appLogWriter, err := newRotatingFileWriter(appLogPath, getenvInt("APP_LOG_MAX_MB", 20))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "init app logger: %v\n", err)
+		os.Exit(1)
+	}
+	defer appLogWriter.Close()
+	log := slog.New(slog.NewJSONHandler(io.MultiWriter(appLogWriter), nil))
 
 	watchAllNamespaces, namespaces := parseWatchNamespaces(getenv("WATCH_NAMESPACES", "default"))
-	brokers := strings.Split(getenv("KAFKA_BROKERS", "kafka:9092"), ",")
-	topic := getenv("KAFKA_TOPIC", "vm-events")
 	resync, _ := time.ParseDuration(getenv("RESYNC_PERIOD", "10m"))
 
 	cfg, err := buildConfig()
@@ -470,22 +502,12 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	sinkType := getenv("SINK_TYPE", "postgres")
-	var pub Publisher
-	switch sinkType {
-	case "postgres":
-		dsn := getenv("POSTGRES_DSN", "postgres://vmwatcher:changeme@postgres:5432/vmwatcher?sslmode=disable")
-		pgPub, err := newPostgresPublisher(ctx, dsn)
-		if err != nil {
-			log.Error("postgres publisher init failed", "err", err)
-			os.Exit(1)
-		}
-		pub = pgPub
-		log.Info("sink: postgres")
-	default:
-		pub = newKafkaPublisher(brokers, topic)
-		log.Info("sink: kafka", "brokers", brokers, "topic", topic)
+	pub, err := newFilePublisher(eventLogPath, getenvInt("EVENT_LOG_MAX_MB", 100))
+	if err != nil {
+		log.Error("file publisher init failed", "err", err, "eventLogPath", eventLogPath)
+		os.Exit(1)
 	}
+	log.Info("sink: file", "eventLogPath", eventLogPath)
 
 	ctrl := &controller{
 		queue: workqueue.NewRateLimitingQueue(
@@ -554,4 +576,16 @@ func getenv(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func getenvInt(k string, def int) int {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return def
+	}
+	return n
 }

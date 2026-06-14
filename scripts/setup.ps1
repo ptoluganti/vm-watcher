@@ -12,9 +12,6 @@
     6. Applies all manifests in deployment/ via kustomize
     7. Optionally creates an example VirtualMachine in a watched namespace
 
-.PARAMETER SinkType
-    Which sink to activate. This setup is Postgres-only by default.
-
 .PARAMETER KubevirtVersion
     KubeVirt version tag to use. Defaults to the stable quickstart version.
 
@@ -35,12 +32,8 @@
 
 .EXAMPLE
     .\scripts\setup.ps1
-    .\scripts\setup.ps1 -SinkType postgres
 #>
 param(
-    [ValidateSet("postgres")]
-    [string]$SinkType = "postgres",
-
     [string]$KubevirtVersion = "",
 
     [bool]$CreateExampleVM = $true,
@@ -187,6 +180,12 @@ docker build -f ".\Dockerfile.consumer" -t "vm-event-consumer:dev" .
 Pop-Location
 Ok "Consumer image built"
 
+Step "Building Docker image vm-log-sidecar:dev (log publisher sidecar)"
+Push-Location $Root
+docker build -f ".\Dockerfile.log-sidecar" -t "vm-log-sidecar:dev" .
+Pop-Location
+Ok "Log sidecar image built"
+
 # ── 4. Load images into kind ─────────────────────────────────────────────────
 Step "Loading $ImageTag into kind cluster"
 kind load docker-image $ImageTag --name vm-watcher-dev
@@ -196,18 +195,16 @@ Step "Loading vm-event-consumer:dev into kind cluster"
 kind load docker-image "vm-event-consumer:dev" --name vm-watcher-dev
 Ok "Consumer image loaded"
 
+Step "Loading vm-log-sidecar:dev into kind cluster"
+kind load docker-image "vm-log-sidecar:dev" --name vm-watcher-dev
+Ok "Log sidecar image loaded"
+
 # ── 5. Patch image in deployment manifest ───────────────────────────────────
 Step "Patching image reference in deployment/04-vm-watcher.yaml"
 $deployFile = "$Root\deployment\04-vm-watcher.yaml"
 (Get-Content $deployFile) -replace 'registry\.example\.com/vm-watcher:latest', $ImageTag |
     Set-Content $deployFile
 Ok "Image patched to $ImageTag"
-
-# ── 6. Patch SINK_TYPE ───────────────────────────────────────────────────────
-Step "Setting SINK_TYPE to '$SinkType'"
-(Get-Content $deployFile) -replace '(value: )"postgres"', "`$1`"$SinkType`"" |
-    Set-Content $deployFile
-Ok "SINK_TYPE set"
 
 # ── 7. Install nginx ingress controller ─────────────────────────────────────
 Step "Installing nginx ingress controller (kind provider)"

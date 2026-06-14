@@ -5,7 +5,6 @@ go 1.22.0
 require (
 	github.com/jackc/pgx/v5 v5.6.0
 	github.com/prometheus/client_golang v1.20.5
-	github.com/segmentio/kafka-go v0.4.47
 	k8s.io/apimachinery v0.30.3
 	k8s.io/client-go v0.30.3
 )

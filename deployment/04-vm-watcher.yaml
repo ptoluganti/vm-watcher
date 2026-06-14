@@ -6,7 +6,7 @@ metadata:
   labels:
     app: vm-watcher
 spec:
-  replicas: 1   # safe to scale >1 for postgres sink (idempotent fingerprint + unique index)
+  replicas: 1   # safe to scale >1; sidecars dedupe via vm_events(event_fingerprint) unique index
   selector:
     matchLabels: { app: vm-watcher }
   template:
@@ -32,15 +32,16 @@ spec:
             # ── namespaces to watch ──────────────────────────────────────────
             - name: WATCH_NAMESPACES
               value: "team-a,team-b"   # use "*" or "all" for every namespace
-            # ── sink selection ────────────────────────────────────────────────
-            - name: SINK_TYPE
-              value: "postgres"
-            # ── postgres settings (used when SINK_TYPE=postgres) ─────────────
-            - name: POSTGRES_DSN
+            - name: POD_NAME
               valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: dsn
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: LOG_DIR
+              value: "/var/log/vm-watcher"
+            - name: APP_LOG_MAX_MB
+              value: "20"
+            - name: EVENT_LOG_MAX_MB
+              value: "100"
             # ── misc ─────────────────────────────────────────────────────────
             - name: RESYNC_PERIOD
               value: "10m"
@@ -52,6 +53,9 @@ spec:
           readinessProbe:
             httpGet: { path: /healthz, port: 8080 }
             initialDelaySeconds: 5
+          volumeMounts:
+            - name: vm-watcher-logs
+              mountPath: /var/log/vm-watcher
           resources:
             requests: { cpu: 50m, memory: 64Mi }
             limits:   { cpu: 500m, memory: 256Mi }
@@ -59,6 +63,43 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
+        - name: log-publisher-sidecar
+          image: vm-log-sidecar:dev
+          imagePullPolicy: Never
+          env:
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: dsn
+            - name: LOG_DIR
+              value: "/var/log/vm-watcher"
+            - name: EVENT_LOG_GLOB
+              value: ""
+            - name: POLL_INTERVAL
+              value: "5s"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: PUBLISHER_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: vm-watcher-logs
+              mountPath: /var/log/vm-watcher
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits:   { cpu: 500m, memory: 256Mi }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+      volumes:
+        - name: vm-watcher-logs
+          persistentVolumeClaim:
+            claimName: vm-watcher-logs
 ---
 apiVersion: v1
 kind: Service
