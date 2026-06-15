@@ -1,5 +1,5 @@
-# PostgreSQL — single-node, dev-grade (emptyDir storage).
-# Swap the emptyDir volume for a PVC in production.
+# PostgreSQL — single-node with persistent PVC storage.
+# Data survives pod/container restarts and redeployments while PVC is retained.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -9,6 +9,18 @@ type: Opaque
 stringData:
   password: "changeme"         # override in production via external secret manager
   dsn: "postgres://vmwatcher:changeme@postgres:5432/vmwatcher?sslmode=disable"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: vm-watcher
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -65,7 +77,8 @@ spec:
               mountPath: /var/lib/postgresql/data
       volumes:
         - name: data
-          emptyDir: {}           # replace with a PVC for persistent storage
+          persistentVolumeClaim:
+            claimName: postgres-data
 ---
 apiVersion: v1
 kind: Service

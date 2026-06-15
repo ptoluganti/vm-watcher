@@ -69,6 +69,121 @@ This deployment uses a decoupled write path:
 - Event log file rotation: `EVENT_LOG_MAX_MB`
 - Mounted storage path: `LOG_DIR` (default `/var/log/vm-watcher`)
 
+## PostgreSQL persistence, backup, and restore
+
+### Persistent data volume
+
+PostgreSQL uses a persistent volume claim:
+
+- PVC name: `postgres-data`
+- Namespace: `vm-watcher`
+- Requested size: `20Gi`
+
+This means PostgreSQL data is not lost when the pod/container restarts.
+
+### Check PVC status
+
+```powershell
+kubectl get pvc -n vm-watcher
+kubectl describe pvc postgres-data -n vm-watcher
+```
+
+### Backup (export)
+
+Use the helper script:
+
+```powershell
+.\scripts\backup-postgres.ps1
+```
+
+Optional destination:
+
+```powershell
+.\scripts\backup-postgres.ps1 -OutputDir .\backups
+```
+
+The script creates a PostgreSQL custom-format dump (`.dump`) that you can copy to external storage (NAS/object storage/file share).
+
+### Restore (import)
+
+Use the helper script:
+
+```powershell
+.\scripts\restore-postgres.ps1 -BackupFile .\backups\vmwatcher-backup-YYYYMMDD-HHMMSS.dump
+```
+
+Restore behavior:
+
+- Uses `pg_restore`
+- Includes `--clean --if-exists` to replace existing objects safely
+
+### Scheduled automatic backups (CronJob)
+
+The deployment includes:
+
+- CronJob: `postgres-backup`
+- Backup PVC: `postgres-backups`
+- Schedule: every 6 hours (`0 */6 * * *`)
+- Retention: 7 days (`BACKUP_RETENTION_DAYS`)
+
+Backup verification:
+
+- CronJob: `postgres-backup-verify`
+- Schedule: every 6 hours, offset by 30 minutes (`30 */6 * * *`)
+- Validates the newest `.dump` backup with `pg_restore --list`
+
+Check backup scheduler state:
+
+```powershell
+kubectl get cronjob -n vm-watcher
+kubectl get jobs -n vm-watcher
+kubectl get pvc postgres-backups -n vm-watcher
+```
+
+Run one backup immediately:
+
+```powershell
+kubectl create job --from=cronjob/postgres-backup postgres-backup-manual -n vm-watcher
+kubectl logs -n vm-watcher job/postgres-backup-manual
+```
+
+Run one verification immediately:
+
+```powershell
+kubectl create job --from=cronjob/postgres-backup-verify postgres-backup-verify-manual -n vm-watcher
+kubectl logs -n vm-watcher job/postgres-backup-verify-manual
+```
+
+List files on backup PVC (helper pod):
+
+```powershell
+kubectl run backup-shell -n vm-watcher --image=busybox:1.36 --restart=Never --overrides '{"spec":{"volumes":[{"name":"b","persistentVolumeClaim":{"claimName":"postgres-backups"}}],"containers":[{"name":"backup-shell","image":"busybox:1.36","command":["sh","-c","sleep 3600"],"volumeMounts":[{"name":"b","mountPath":"/backups"}]}]}}'
+kubectl wait --for=condition=Ready pod/backup-shell -n vm-watcher --timeout=60s
+kubectl exec -n vm-watcher backup-shell -- ls -lh /backups
+```
+
+Copy one backup file locally:
+
+```powershell
+kubectl cp vm-watcher/backup-shell:/backups/vmwatcher-backup-YYYYMMDD-HHMMSS.dump .\backups\
+kubectl delete pod backup-shell -n vm-watcher
+```
+
+Helper scripts:
+
+```powershell
+./scripts/run-postgres-backup-job.ps1
+./scripts/run-postgres-backup-verify-job.ps1
+```
+
+### Optional one-time in-cluster SQL backup file
+
+```powershell
+$pod = kubectl get pod -n vm-watcher -l app=postgres -o jsonpath="{.items[0].metadata.name}"
+kubectl exec -n vm-watcher $pod -- sh -lc "pg_dump -U vmwatcher -d vmwatcher > /tmp/vmwatcher.sql"
+kubectl cp "vm-watcher/$pod:/tmp/vmwatcher.sql" .\vmwatcher.sql
+```
+
 ## How watcher works (overview)
 
 The watcher listens for KubeVirt VirtualMachine API events, transforms each event into a JSON payload, and then processes it in two paths:

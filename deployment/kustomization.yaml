@@ -13,3 +13,5 @@ resources:
   - 08-grafana-config.yaml
   - 09-grafana.yaml
   - 13-vm-event-consumer.yaml
+  - 14-postgres-backup-cronjob.yaml
+  - 15-postgres-backup-verify-cronjob.yaml

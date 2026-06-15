@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-backups
+  namespace: vm-watcher
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 20Gi
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup
+  namespace: vm-watcher
+spec:
+  schedule: "0 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          restartPolicy: OnFailure
+          containers:
+            - name: pg-backup
+              image: postgres:16
+              imagePullPolicy: IfNotPresent
+              env:
+                - name: POSTGRES_DB
+                  value: vmwatcher
+                - name: POSTGRES_USER
+                  value: vmwatcher
+                - name: POSTGRES_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: postgres-secret
+                      key: password
+                - name: BACKUP_RETENTION_DAYS
+                  value: "7"
+              command:
+                - /bin/sh
+                - -lc
+                - |
+                  set -euo pipefail
+                  TS="$(date -u +%Y%m%d-%H%M%S)"
+                  OUT="/backups/vmwatcher-backup-${TS}.dump"
+                  export PGPASSWORD="${POSTGRES_PASSWORD}"
+                  pg_dump -h postgres -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -Fc -f "$OUT"
+                  find /backups -type f -name 'vmwatcher-backup-*.dump' -mtime +"${BACKUP_RETENTION_DAYS}" -delete
+              volumeMounts:
+                - name: backup-volume
+                  mountPath: /backups
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+          volumes:
+            - name: backup-volume
+              persistentVolumeClaim:
+                claimName: postgres-backups

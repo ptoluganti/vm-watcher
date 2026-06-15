@@ -1,0 +1,51 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: postgres-backup-verify
+  namespace: vm-watcher
+spec:
+  schedule: "30 */6 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: ""
+          tolerations:
+            - key: node-role.kubernetes.io/control-plane
+              operator: Exists
+              effect: NoSchedule
+          restartPolicy: OnFailure
+          containers:
+            - name: pg-verify
+              image: postgres:16
+              imagePullPolicy: IfNotPresent
+              command:
+                - /bin/sh
+                - -lc
+                - |
+                  set -euo pipefail
+                  LATEST="$(ls -1t /backups/vmwatcher-backup-*.dump 2>/dev/null | head -n1 || true)"
+                  if [ -z "$LATEST" ]; then
+                    echo "No backup files found in /backups"
+                    exit 1
+                  fi
+                  pg_restore --list "$LATEST" >/dev/null
+                  echo "Backup integrity OK: $LATEST"
+              volumeMounts:
+                - name: backup-volume
+                  mountPath: /backups
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 500m
+                  memory: 256Mi
+          volumes:
+            - name: backup-volume
+              persistentVolumeClaim:
+                claimName: postgres-backups
