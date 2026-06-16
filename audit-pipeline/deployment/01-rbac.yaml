@@ -1,8 +1,0 @@
-# ServiceAccount for the audit-sink pod.
-# The sink only makes outbound TCP connections to Kafka and PostgreSQL;
-# it needs no Kubernetes API access beyond the default token projection.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: audit-sink
-  namespace: vm-audit

@@ -1,6 +1,0 @@
-bin/
-*.exe
-*.test
-*.out
-vendor/
-.DS_Store
