@@ -1,0 +1,34 @@
+# ClusterLogForwarder — routes kube-apiserver audit events to the vm-audit-raw
+# Kafka topic via the OpenShift Logging collector (Vector).
+#
+# Prerequisites:
+#   • Red Hat OpenShift Logging Operator installed in openshift-logging.
+#   • Strimzi Kafka cluster vm-audit-cluster running in vm-audit namespace.
+#
+# The "audit" built-in inputRef selects kube-apiserver, OpenShift API server,
+# and OAuth server audit logs.  The Go sink pre-filters by "virtualmachines"
+# and then by objectRef fields, so no CLF-side content filter is required.
+# This keeps the CLF configuration simple and avoids version-specific VRL
+# syntax differences between OCP Logging 5.x releases.
+#
+# NOTE: This resource lives in openshift-logging (a system namespace) because
+# that is where the Logging operator watches for ClusterLogForwarder resources.
+# The Kafka bootstrap address crosses namespaces via in-cluster DNS.
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: vm-audit-forwarder
+  namespace: openshift-logging
+spec:
+  outputs:
+    - name: vm-audit-kafka
+      type: kafka
+      # URL format: tcp://<bootstrap>/<topic>  (use kafka+ssl:// for TLS)
+      url: "tcp://vm-audit-cluster-kafka-bootstrap.vm-audit.svc:9092/vm-audit-raw"
+  pipelines:
+    - name: vm-audit-pipeline
+      # "audit" is a built-in inputRef that captures kube-apiserver audit logs.
+      inputRefs:
+        - audit
+      outputRefs:
+        - vm-audit-kafka
