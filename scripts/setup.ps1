@@ -46,7 +46,7 @@ param(
 
     [string]$WindowsImageUrl = "",
 
-    [string]$ImageTag = "vm-watcher:dev"
+    [string]$ImageTag = "vm-audit-sink:dev"
 )
 
 Set-StrictMode -Version Latest
@@ -176,12 +176,12 @@ if ($CreateWindowsDataVolume) {
     kubectl get pods -n cdi
 }
 
-# ── 3. Build Docker images (watcher + consumer) ───────────────────────────────
-Step "Building Docker image $ImageTag (vm-watcher)"
+# ── 3. Build Docker images (audit sink + legacy helpers) ─────────────────────
+Step "Building Docker image $ImageTag (audit sink)"
 Push-Location $Root
 docker build -t $ImageTag .
 Pop-Location
-Ok "Watcher image built"
+Ok "Audit sink image built"
 
 Step "Building Docker image vm-event-consumer:dev (event consumer)"
 Push-Location $Root
@@ -208,13 +208,6 @@ Step "Loading vm-log-sidecar:dev into kind cluster"
 kind load docker-image "vm-log-sidecar:dev" --name vm-watcher-dev
 Ok "Log sidecar image loaded"
 
-# ── 5. Patch image in deployment manifest ───────────────────────────────────
-Step "Patching image reference in deployment/04-vm-watcher.yaml"
-$deployFile = "$Root\deployment\04-vm-watcher.yaml"
-(Get-Content $deployFile) -replace 'registry\.example\.com/vm-watcher:latest', $ImageTag |
-    Set-Content $deployFile
-Ok "Image patched to $ImageTag"
-
 # ── 7. Install nginx ingress controller ─────────────────────────────────────
 Step "Installing nginx ingress controller (kind provider)"
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
@@ -227,12 +220,7 @@ kubectl wait --namespace ingress-nginx `
     --timeout=120s
 Ok "nginx ingress controller is ready"
 
-# ── 8. Apply manifests ───────────────────────────────────────────────────────
-Step "Applying manifests via kustomize"
-kubectl apply -k "$Root\deployment"
-Ok "Manifests applied"
-
-# ── 8b. Install Strimzi operator and deploy Kafka cluster ───────────────────
+# ── 8. Install Strimzi operator before applying Kafka manifests ─────────────
 Step "Installing Strimzi operator $StrimziVersion (single-namespace mode in vm-watcher)"
 $strimziUrl = "https://github.com/strimzi/strimzi-kafka-operator/releases/download/$StrimziVersion/strimzi-cluster-operator-$StrimziVersion.yaml"
 $strimziYaml = Invoke-RestMethod -Uri $strimziUrl
@@ -245,6 +233,11 @@ Step "Waiting for Strimzi cluster operator to be ready"
 kubectl rollout status deployment/strimzi-cluster-operator -n vm-watcher --timeout=120s
 Ok "Strimzi cluster operator is ready"
 
+# ── 9. Apply manifests ───────────────────────────────────────────────────────
+Step "Applying manifests via kustomize"
+kubectl apply -k "$Root\deployment"
+Ok "Manifests applied"
+
 Step "Deploying Kafka cluster via Strimzi (KRaft, single combined node)"
 kubectl apply -f "$Root\deployment\16-kafka.yaml"
 Ok "Kafka cluster manifest applied"
@@ -252,28 +245,28 @@ Ok "Kafka cluster manifest applied"
 Step "Waiting for Kafka cluster to become ready (this may take 2-3 minutes)"
 $kafkaDeadline = (Get-Date).AddSeconds(300)
 do {
-    $ready = kubectl get kafka vm-events-cluster -n vm-watcher `
+    $ready = kubectl get kafka vm-audit-cluster -n vm-watcher `
         -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}" 2>$null
     if ($ready -eq "True") { break }
     Start-Sleep -Seconds 10
 } while ((Get-Date) -lt $kafkaDeadline)
 if ($ready -ne "True") {
-    Fail "Kafka cluster vm-events-cluster did not become Ready within 300s"
+    Fail "Kafka cluster vm-audit-cluster did not become Ready within 300s"
 }
 Ok "Kafka cluster is ready"
 
-Step "Waiting for KafkaTopic vm-events to be ready"
+Step "Waiting for KafkaTopic vm-audit-raw to be ready"
 $topicDeadline = (Get-Date).AddSeconds(120)
 do {
-    $topicReady = kubectl get kafkatopic vm-events -n vm-watcher `
+    $topicReady = kubectl get kafkatopic vm-audit-raw -n vm-watcher `
         -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}" 2>$null
     if ($topicReady -eq "True") { break }
     Start-Sleep -Seconds 5
 } while ((Get-Date) -lt $topicDeadline)
 if ($topicReady -ne "True") {
-    Fail "KafkaTopic vm-events did not become Ready within 120s"
+    Fail "KafkaTopic vm-audit-raw did not become Ready within 120s"
 }
-Ok "KafkaTopic vm-events is ready"
+Ok "KafkaTopic vm-audit-raw is ready"
 
 # ── 8a. Apply ingress resources after controller webhook is ready ───────────
 Step "Applying ingress resources"
@@ -338,24 +331,21 @@ Write-Host "  echo '127.0.0.1 grafana.local prometheus.local' | sudo tee -a /etc
 Write-Host "`n  Grafana    -> http://grafana.local    (admin / admin)" -ForegroundColor Green
 Write-Host "  Prometheus -> http://prometheus.local" -ForegroundColor Green
 Write-Host "  Healthz    -> http://localhost:8080/healthz" -ForegroundColor Green
-Write-Host "  PostgreSQL -> localhost:5432  db=vmwatcher  user=vmwatcher  pass=changeme" -ForegroundColor GreenWrite-Host "  Kafka      -> vm-events-cluster-kafka-bootstrap.vm-watcher.svc:9092  topic=vm-events" -ForegroundColor GreenWrite-Host "`nGrafana Dashboards Available:" -ForegroundColor Yellow
-Write-Host "  - VM Watcher - Lifecycle Overview" -ForegroundColor Green
-Write-Host "  - VM Watcher - Per Namespace Changes" -ForegroundColor Green
-Write-Host "  - VM Watcher - PostgreSQL Events" -ForegroundColor Green
-Write-Host "  - VM Watcher - Consumer State & Anomalies (NEW)" -ForegroundColor Green
+Write-Host "  PostgreSQL -> localhost:5432  db=vmwatcher  user=vmwatcher  pass=changeme" -ForegroundColor Green
+Write-Host "  Kafka      -> vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092  topic=vm-audit-raw" -ForegroundColor Green
+Write-Host "`nGrafana Dashboards Available:" -ForegroundColor Yellow
+Write-Host "  - Audit Pipeline - Recent VM Mutations" -ForegroundColor Green
+Write-Host "  - Audit Pipeline - Kafka Lag" -ForegroundColor Green
+Write-Host "  - Audit Pipeline - PostgreSQL Events" -ForegroundColor Green
 Write-Host "`nUseful commands:" -ForegroundColor Yellow
-Write-Host "kubectl logs -n vm-watcher deploy/vm-watcher -f" -ForegroundColor Yellow
-Write-Host "kubectl logs -n vm-watcher deploy/vm-event-consumer -f" -ForegroundColor Yellow
-Write-Host "kubectl get vm -A" -ForegroundColor Yellow
+Write-Host "kubectl logs -n vm-watcher deploy/audit-sink -f" -ForegroundColor Yellow
 Write-Host "kubectl get pods -n vm-watcher -w" -ForegroundColor Yellow
 Write-Host ".\scripts\inspect-sink.ps1 -SinkType postgres -Tail 20" -ForegroundColor Yellow
 Write-Host "`nConsumer state inspection (SQL):" -ForegroundColor Yellow
 Write-Host "# VM state snapshot" -ForegroundColor DarkYellow
-Write-Host "SELECT event_key, last_status, total_events, updated_at FROM vm_state ORDER BY updated_at DESC;" -ForegroundColor DarkYellow
-Write-Host "# Recent anomalies" -ForegroundColor DarkYellow
-Write-Host "SELECT event_key, from_status, to_status, reason FROM vm_state_transitions WHERE anomaly=true ORDER BY transition_at DESC LIMIT 10;" -ForegroundColor DarkYellow
-Write-Host "# Consumer lag" -ForegroundColor DarkYellow
-Write-Host "SELECT (SELECT MAX(id) FROM vm_events) - MAX(last_event_id) AS lag FROM consumer_offsets;" -ForegroundColor DarkYellow
+Write-Host "SELECT audit_id, verb, namespace, name, response_code, stage_timestamp FROM vm_audit_events ORDER BY stage_timestamp DESC LIMIT 20;" -ForegroundColor DarkYellow
+Write-Host "# Kafka consumer health" -ForegroundColor DarkYellow
+Write-Host "kubectl get deploy audit-sink -n vm-watcher" -ForegroundColor DarkYellow
 Write-Host "`nOptional Windows VM setup:" -ForegroundColor Yellow
 Write-Host "kubectl apply -f deployment/12-example-windows-datavolume.yaml" -ForegroundColor Yellow
 Write-Host "kubectl get dv -n team-b windows-rootdisk -o wide" -ForegroundColor Yellow

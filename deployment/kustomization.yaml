@@ -6,12 +6,7 @@ resources:
   - 01-rbac.yaml
   - 03-log-storage.yaml
   - 02-postgres.yaml
-  - 04-vm-watcher.yaml
-  - 05-example-vm.yaml
-  - 06-prometheus-config.yaml
-  - 07-prometheus.yaml
-  - 08-grafana-config.yaml
-  - 09-grafana.yaml
-  - 13-vm-event-consumer.yaml
+  - 16-kafka.yaml
+  - 05-audit-sink.yaml
   - 14-postgres-backup-cronjob.yaml
   - 15-postgres-backup-verify-cronjob.yaml

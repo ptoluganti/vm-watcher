@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: audit-sink
+  namespace: vm-watcher
+  labels:
+    app: audit-sink
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: audit-sink
+  template:
+    metadata:
+      labels:
+        app: audit-sink
+    spec:
+      serviceAccountName: vm-watcher
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: audit-sink
+          image: vm-audit-sink:dev
+          imagePullPolicy: Never
+          env:
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: dsn
+            - name: KAFKA_BROKERS
+              value: "vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092"
+            - name: KAFKA_TOPIC
+              value: "vm-audit-raw"
+            - name: KAFKA_GROUP_ID
+              value: "vm-audit-sink"
+            - name: KAFKA_MAX_WAIT
+              value: "500ms"
+            - name: HTTP_ADDR
+              value: ":8080"
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

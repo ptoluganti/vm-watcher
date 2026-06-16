@@ -1,0 +1,21 @@
+# OpenShift ClusterLogForwarder that routes kube-apiserver audit logs to Kafka.
+#
+# This manifest is OpenShift-specific. It requires the Red Hat OpenShift Logging
+# operator and the ClusterLogForwarder CRD. The pipeline forwards the built-in
+# audit input to the Strimzi Kafka topic vm-audit-raw.
+apiVersion: logging.openshift.io/v1
+kind: ClusterLogForwarder
+metadata:
+  name: vm-audit-forwarder
+  namespace: openshift-logging
+spec:
+  outputs:
+    - name: vm-audit-kafka
+      type: kafka
+      url: "tcp://vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092/vm-audit-raw"
+  pipelines:
+    - name: vm-audit-pipeline
+      inputRefs:
+        - audit
+      outputRefs:
+        - vm-audit-kafka

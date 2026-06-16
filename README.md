@@ -1,23 +1,15 @@
 # vm-watcher
 
-KubeVirt VM event watcher for Kubernetes using a file-first event pipeline: watcher writes rotating JSONL logs, sidecar publishes to PostgreSQL with dedupe, and Prometheus/Grafana provide observability.
+KubeVirt VM audit pipeline for OpenShift/Kubernetes: kube-apiserver audit logs flow through Vector into Kafka, and a Go sink stores authoritative VirtualMachine mutations in PostgreSQL with dedupe and manual offset commits.
 
 ## What this project includes
 
-- Go watcher service (KubeVirt VirtualMachine watch)
-- Rotating event/app log files on mounted storage
-- Sidecar log publisher (`cmd/log-sidecar-publisher`)
-- PostgreSQL sink (`vm_events` table) via sidecar upsert
-- Sidecar checkpoint table (`vm_log_offsets`) for resumable file reads
-- Prometheus metrics endpoint (`/metrics`)
-- Grafana dashboards (Prometheus + PostgreSQL datasources)
-- NGINX ingress routing for local access:
-  - `http://grafana.local`
-  - `http://prometheus.local`
-- Example VMs:
-  - Fedora VM (`team-a`)
-  - Alpine VM (`team-b`)
-  - Windows VM template (`team-b`)
+- Go audit sink (`cmd/audit-sink`)
+- kube-apiserver audit log forwarding via OpenShift `ClusterLogForwarder`
+- Strimzi Kafka durable buffer (`vm-audit-raw`)
+- PostgreSQL sink (`vm_audit_events` table) via `auditID` dedupe
+- Health endpoint (`/healthz`)
+- Optional Grafana/Prometheus overlays if you still want them for other workloads
 
 ## Prerequisites
 
@@ -39,35 +31,34 @@ This will:
 1. Create/reuse kind cluster (`vm-watcher-dev`)
 2. Install KubeVirt
 3. Install ingress-nginx
-4. Build/load `vm-watcher:dev`, `vm-log-sidecar:dev`, `vm-event-consumer:dev`
-5. Deploy PostgreSQL, vm-watcher (+ sidecar), Prometheus, Grafana, consumer, and Ingress
-6. Apply Fedora example VM (default)
+4. Build/load `vm-audit-sink:dev`
+5. Install Strimzi, deploy PostgreSQL, Kafka, and the audit sink
+6. Apply the audit forwarding manifest for OpenShift environments
 
 ## Design document
 
 ### Architecture
 
-This deployment uses a decoupled write path:
+This deployment uses an audit-log write path:
 
-1. `vm-watcher` watches KubeVirt `VirtualMachine` resources.
-2. Watcher serializes full event JSON (including spec/status/disks) into rotating JSONL files on shared storage.
-3. `log-publisher-sidecar` reads those files and inserts into PostgreSQL using idempotent SQL.
-4. PostgreSQL enforces global dedupe with unique `event_fingerprint`.
-5. Sidecar persists file offsets in `vm_log_offsets` to avoid full-file rescans.
+1. kube-apiserver emits authoritative audit events for every mutating VM request.
+2. OpenShift `ClusterLogForwarder` forwards the audit stream to Kafka topic `vm-audit-raw`.
+3. `cmd/audit-sink` consumes Kafka with manual offset commits and filters for KubeVirt `virtualmachines` events.
+4. PostgreSQL enforces global dedupe with `auditID` as the primary key.
+5. Kafka provides the durable replay buffer; PostgreSQL remains the queryable store.
 
-### Multi-instance behavior
+### Delivery behavior
 
-- Multiple watcher replicas are supported.
-- Each watcher writes to a pod-specific file by default: `events-<pod>.jsonl`.
-- Sidecar defaults to reading only its pod file pattern (unless `EVENT_LOG_GLOB` is explicitly widened).
-- Same storage location can be shared across replicas.
-- Duplicate event rows are prevented in PostgreSQL by `ON CONFLICT (event_fingerprint) DO NOTHING`.
+- Multiple sink replicas can share the same Kafka consumer group.
+- Kafka partitions provide parallelism; one partition is owned by one consumer at a time.
+- Manual offset commits happen only after the PostgreSQL insert succeeds.
+- Duplicate event rows are prevented in PostgreSQL by `ON CONFLICT (audit_id) DO NOTHING`.
 
-### Storage and file-size limits
+### Low-latency ingest
 
-- App log file rotation: `APP_LOG_MAX_MB`
-- Event log file rotation: `EVENT_LOG_MAX_MB`
-- Mounted storage path: `LOG_DIR` (default `/var/log/vm-watcher`)
+- Kafka consumer wait bound: `KAFKA_MAX_WAIT` (default `500ms`)
+- The sink pre-filters with a cheap byte search before parsing JSON.
+- The sink also filters by `objectRef.resource`, `objectRef.apiGroup`, `stage`, and HTTP status.
 
 ## PostgreSQL persistence, backup, and restore
 

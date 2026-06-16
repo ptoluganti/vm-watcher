@@ -1,670 +1,387 @@
-// vm-watcher: watches KubeVirt VirtualMachine resources in specific namespaces
-// and publishes create/update/delete events to a configured sink.
+// vm-audit-sink consumes kube-apiserver audit events for KubeVirt
+// VirtualMachine mutations from Kafka and stores them in PostgreSQL.
+//
+// Audit log, not watch/informer:
+// A watch re-lists on expiry and can collapse intermediate transitions.
+// The kube-apiserver audit log is authoritative: it records every mutating
+// request, which we stream through Vector/ClusterLogForwarder into Kafka.
+//
+// auditID as dedupe key:
+// audit.k8s.io/v1.Event.AuditID is a stable per-request UUID. Using it as
+// the PRIMARY KEY makes Kafka redelivery, collector restarts, and retries
+// idempotent without silent loss.
+//
+// persist-then-commit:
+// The Kafka offset is committed only after PostgreSQL confirms the row.
+// If the process crashes in between, the message is redelivered and the
+// ON CONFLICT DO NOTHING upsert is a harmless no-op.
 package main
 
 import (
+	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	kafka "github.com/segmentio/kafka-go"
-
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/client-go/dynamic"
-	"k8s.io/client-go/dynamic/dynamicinformer"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/cache"
-	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/client-go/util/workqueue"
 )
 
-// Swap to VirtualMachineInstance if you want runtime (pod-level) lifecycle:
-// Resource: "virtualmachineinstances"
-var vmGVR = schema.GroupVersionResource{
-	Group:    "kubevirt.io",
-	Version:  "v1",
-	Resource: "virtualmachines",
+type auditEvent struct {
+	AuditID                  string          `json:"auditID"`
+	Stage                    string          `json:"stage"`
+	Verb                     string          `json:"verb"`
+	ObjectRef                *objectRef      `json:"objectRef,omitempty"`
+	ResponseStatus           *responseStatus `json:"responseStatus,omitempty"`
+	RequestReceivedTimestamp time.Time       `json:"requestReceivedTimestamp"`
+	StageTimestamp           time.Time       `json:"stageTimestamp"`
+	User                     userInfo        `json:"user"`
+	RequestObject            json.RawMessage `json:"requestObject,omitempty"`
+	ResponseObject           json.RawMessage `json:"responseObject,omitempty"`
 }
 
-type EventType string
-
-const (
-	EventAdded   EventType = "ADDED"
-	EventUpdated EventType = "MODIFIED"
-	EventDeleted EventType = "DELETED"
-)
-
-var (
-	vmEventsObservedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "vm_events_observed_total",
-		Help: "Total number of VM watch events observed by the informer.",
-	}, []string{"type", "namespace"})
-
-	vmEventsPublishedTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "vm_events_published_total",
-		Help: "Total number of VM events successfully published to the sink.",
-	}, []string{"type", "namespace", "name"})
-
-	vmEventsPublishFailuresTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "vm_events_publish_failures_total",
-		Help: "Total number of VM events that failed to publish.",
-	}, []string{"type", "namespace", "name"})
-
-	vmEventsPublishConflictsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "vm_events_publish_conflicts_total",
-		Help: "Total number of VM events skipped due to idempotency conflict.",
-	}, []string{"type", "namespace", "name"})
-
-	vmEventsFilteredTotal = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "vm_events_filtered_total",
-		Help: "Total number of VM events filtered before enqueueing.",
-	}, []string{"reason", "namespace", "name"})
-
-	vmEventQueueDepth = promauto.NewGauge(prometheus.GaugeOpts{
-		Name: "vm_event_queue_depth",
-		Help: "Current number of queued VM events waiting to be published.",
-	})
-
-	vmLastEventUnixSeconds = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "vm_last_event_unix_seconds",
-		Help: "Unix timestamp of the most recent published VM event.",
-	}, []string{"namespace", "name", "type"})
-)
-
-// VMEvent is the wire format published to the queue.
-// uid + resourceVersion let consumers dedupe (at-least-once delivery).
-type VMEvent struct {
-	Type             EventType                `json:"type"`
-	Namespace        string                   `json:"namespace"`
-	Name             string                   `json:"name"`
-	UID              string                   `json:"uid"`
-	ResourceVersion  string                   `json:"resourceVersion"`
-	Generation       int64                    `json:"generation"`
-	RunStrategy      string                   `json:"runStrategy,omitempty"`
-	PrintableStatus  string                   `json:"status,omitempty"`
-	EventFingerprint string                   `json:"eventFingerprint"`
-	Timestamp        time.Time                `json:"timestamp"`
-	Labels           map[string]string        `json:"labels,omitempty"`
-	Annotations      map[string]string        `json:"annotations,omitempty"`
-	OwnerReferences  []map[string]interface{} `json:"ownerReferences,omitempty"`
-	Spec             json.RawMessage          `json:"spec,omitempty"`
-	StatusObject     json.RawMessage          `json:"statusObject,omitempty"`
-	Disks            json.RawMessage          `json:"disks,omitempty"`
+type objectRef struct {
+	Resource        string `json:"resource"`
+	Namespace       string `json:"namespace"`
+	Name            string `json:"name"`
+	UID             string `json:"uid"`
+	APIGroup        string `json:"apiGroup"`
+	APIVersion      string `json:"apiVersion"`
+	ResourceVersion string `json:"resourceVersion"`
+	Subresource     string `json:"subresource,omitempty"`
 }
 
-// Publisher abstracts the sink used by the watcher.
-type Publisher interface {
-	Publish(ctx context.Context, key, fingerprint string, payload []byte) (bool, error)
-	Close() error
+type responseStatus struct {
+	Code int32 `json:"code"`
 }
 
-type rotatingFileWriter struct {
-	mu       sync.Mutex
-	path     string
-	maxBytes int64
-	file     *os.File
+type userInfo struct {
+	Username string   `json:"username"`
+	Groups   []string `json:"groups,omitempty"`
 }
 
-func newRotatingFileWriter(path string, maxMB int) (*rotatingFileWriter, error) {
-	if maxMB <= 0 {
-		maxMB = 100
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, err
-	}
-	return &rotatingFileWriter{path: path, maxBytes: int64(maxMB) * 1024 * 1024, file: f}, nil
+// Vector can emit the raw audit event directly or wrap it inside a top-level
+// message field depending on the collector configuration.
+type logEnvelope struct {
+	Message string `json:"message"`
 }
 
-func (w *rotatingFileWriter) rotateIfNeeded(nextWriteLen int) error {
-	st, err := w.file.Stat()
-	if err != nil {
-		return err
-	}
-	if st.Size()+int64(nextWriteLen) <= w.maxBytes {
-		return nil
-	}
-	if err := w.file.Close(); err != nil {
-		return err
-	}
-	rotated := fmt.Sprintf("%s.%d", w.path, time.Now().UTC().UnixNano())
-	if err := os.Rename(w.path, rotated); err != nil {
-		return err
-	}
-	f, err := os.OpenFile(w.path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	w.file = f
-	return nil
-}
-
-func (w *rotatingFileWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if err := w.rotateIfNeeded(len(p)); err != nil {
-		return 0, err
-	}
-	return w.file.Write(p)
-}
-
-func (w *rotatingFileWriter) Close() error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.file == nil {
-		return nil
-	}
-	err := w.file.Close()
-	w.file = nil
-	return err
-}
-
-type filePublisher struct {
-	writer *rotatingFileWriter
-}
-
-func newFilePublisher(path string, maxMB int) (*filePublisher, error) {
-	w, err := newRotatingFileWriter(path, maxMB)
-	if err != nil {
-		return nil, err
-	}
-	return &filePublisher{writer: w}, nil
-}
-
-func (p *filePublisher) Publish(_ context.Context, _, _ string, payload []byte) (bool, error) {
-	line := append(payload, '\n')
-	if _, err := p.writer.Write(line); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (p *filePublisher) Close() error {
-	return p.writer.Close()
-}
-
-// kafkaPublisher implements Publisher by writing each event as a Kafka message.
-// The message key is the event key (namespace/name) so Kafka routes all events
-// for the same VM to the same partition (ordered delivery per VM).
-type kafkaPublisher struct {
-	writer *kafka.Writer
-}
-
-func newKafkaPublisher(brokers []string, topic string) *kafkaPublisher {
-	w := kafka.NewWriter(kafka.WriterConfig{
-		Brokers:      brokers,
-		Topic:        topic,
-		Balancer:     &kafka.Hash{},
-		RequiredAcks: int(kafka.RequireOne),
-		// Batch small writes for throughput; the watcher is not latency-critical.
-		BatchTimeout: 5 * time.Millisecond,
-	})
-	return &kafkaPublisher{writer: w}
-}
-
-func (p *kafkaPublisher) Publish(ctx context.Context, key, _ string, payload []byte) (bool, error) {
-	err := p.writer.WriteMessages(ctx, kafka.Message{
-		Key:   []byte(key),
-		Value: payload,
-	})
-	if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (p *kafkaPublisher) Close() error {
-	return p.writer.Close()
-}
-
-// fanoutPublisher fans out each Publish call to all underlying publishers.
-// The first non-nil error is returned; other publishers still run.
-// stored=true if at least one publisher confirms delivery.
-type fanoutPublisher struct {
-	publishers []Publisher
-}
-
-func (fp *fanoutPublisher) Publish(ctx context.Context, key, fingerprint string, payload []byte) (bool, error) {
-	var firstErr error
-	stored := false
-	for _, pub := range fp.publishers {
-		ok, err := pub.Publish(ctx, key, fingerprint, payload)
-		if err != nil && firstErr == nil {
-			firstErr = err
-		}
-		if ok {
-			stored = true
-		}
-	}
-	return stored, firstErr
-}
-
-func (fp *fanoutPublisher) Close() error {
-	var firstErr error
-	for _, pub := range fp.publishers {
-		if err := pub.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
-
-type controller struct {
-	queue     workqueue.RateLimitingInterface
-	publisher Publisher
-	log       *slog.Logger
-}
-
-func (c *controller) handlers() cache.ResourceEventHandler {
-	return cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj interface{}) {
-			c.enqueue(EventAdded, obj)
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			oldU, newU := oldObj.(*unstructured.Unstructured), newObj.(*unstructured.Unstructured)
-			// Informer resyncs re-deliver identical objects; drop them.
-			if oldU.GetResourceVersion() == newU.GetResourceVersion() {
-				vmEventsFilteredTotal.WithLabelValues("same_resource_version", newU.GetNamespace(), newU.GetName()).Inc()
-				return
-			}
-			if significantState(oldU) == significantState(newU) {
-				vmEventsFilteredTotal.WithLabelValues("insignificant_modified", newU.GetNamespace(), newU.GetName()).Inc()
-				return
-			}
-			c.enqueue(EventUpdated, newObj)
-		},
-		DeleteFunc: func(obj interface{}) {
-			// Handle tombstones from missed delete watch events.
-			if tomb, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				obj = tomb.Obj
-			}
-			c.enqueue(EventDeleted, obj)
-		},
-	}
-}
-
-func (c *controller) enqueue(t EventType, obj interface{}) {
-	u, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		c.log.Error("unexpected object type in handler", "type", fmt.Sprintf("%T", obj))
-		return
-	}
-	runStrategy, _, _ := unstructured.NestedString(u.Object, "spec", "runStrategy")
-	status, _, _ := unstructured.NestedString(u.Object, "status", "printableStatus")
-
-	// Extract labels
-	labels := u.GetLabels()
-	if labels == nil {
-		labels = make(map[string]string)
-	}
-
-	// Extract annotations
-	annotations := u.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string)
-	}
-
-	// Extract owner references
-	var ownerRefs []map[string]interface{}
-	for _, owner := range u.GetOwnerReferences() {
-		ownerRef := map[string]interface{}{
-			"apiVersion": owner.APIVersion,
-			"kind":       owner.Kind,
-			"name":       owner.Name,
-			"uid":        owner.UID,
-			"controller": owner.Controller,
-		}
-		ownerRefs = append(ownerRefs, ownerRef)
-	}
-
-	// Extract full spec
-	var specRaw json.RawMessage
-	if spec, ok := u.Object["spec"]; ok {
-		if specBytes, err := json.Marshal(spec); err == nil {
-			specRaw = specBytes
-		}
-	}
-
-	// Extract full status
-	var statusRaw json.RawMessage
-	if vmStatus, ok := u.Object["status"]; ok {
-		if statusBytes, err := json.Marshal(vmStatus); err == nil {
-			statusRaw = statusBytes
-		}
-	}
-
-	// Extract disks array from spec.template.spec.volumes
-	var disksRaw json.RawMessage
-	if volumes, ok, _ := unstructured.NestedSlice(u.Object, "spec", "template", "spec", "volumes"); ok {
-		var disks []interface{}
-		for _, v := range volumes {
-			vol, _ := v.(map[string]interface{})
-			if vol != nil {
-				// Include all volume info (name, diskSize, source, etc.)
-				disks = append(disks, vol)
-			}
-		}
-		if len(disks) > 0 {
-			if disksBytes, err := json.Marshal(disks); err == nil {
-				disksRaw = disksBytes
-			}
-		}
-	}
-
-	ts := time.Now().UTC()
-	ev := VMEvent{
-		Type:            t,
-		Namespace:       u.GetNamespace(),
-		Name:            u.GetName(),
-		UID:             string(u.GetUID()),
-		ResourceVersion: u.GetResourceVersion(),
-		Generation:      u.GetGeneration(),
-		RunStrategy:     runStrategy,
-		PrintableStatus: status,
-		Timestamp:       ts,
-		Labels:          labels,
-		Annotations:     annotations,
-		OwnerReferences: ownerRefs,
-		Spec:            specRaw,
-		StatusObject:    statusRaw,
-		Disks:           disksRaw,
-	}
-	ev.EventFingerprint = eventFingerprint(ev)
-
-	vmEventsObservedTotal.WithLabelValues(string(t), u.GetNamespace()).Inc()
-	c.queue.Add(ev)
-	vmEventQueueDepth.Set(float64(c.queue.Len()))
-}
-
-// worker drains the queue and publishes; rate-limited retries on broker errors
-// so a flapping broker never blocks the informers.
-func (c *controller) runWorker(ctx context.Context) {
-	for {
-		item, shutdown := c.queue.Get()
-		if shutdown {
-			return
-		}
-		ev, ok := item.(VMEvent)
-		if !ok {
-			c.log.Error("unexpected queue item type", "type", fmt.Sprintf("%T", item))
-			c.queue.Done(item)
-			c.queue.Forget(item)
-			vmEventQueueDepth.Set(float64(c.queue.Len()))
-			continue
-		}
-		func() {
-			defer c.queue.Done(ev)
-			payload, err := json.Marshal(ev)
-			if err != nil {
-				c.log.Error("marshal failed, dropping", "err", err)
-				vmEventsPublishFailuresTotal.WithLabelValues(string(ev.Type), ev.Namespace, ev.Name).Inc()
-				c.queue.Forget(ev)
-				vmEventQueueDepth.Set(float64(c.queue.Len()))
-				return
-			}
-			pubCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-			stored, err := c.publisher.Publish(pubCtx, ev.Namespace+"/"+ev.Name, ev.EventFingerprint, payload)
-			if err != nil {
-				c.log.Warn("publish failed, requeueing",
-					"vm", ev.Namespace+"/"+ev.Name, "type", ev.Type,
-					"retries", c.queue.NumRequeues(ev), "err", err)
-				vmEventsPublishFailuresTotal.WithLabelValues(string(ev.Type), ev.Namespace, ev.Name).Inc()
-				if c.queue.NumRequeues(ev) < 12 {
-					c.queue.AddRateLimited(ev)
-					vmEventQueueDepth.Set(float64(c.queue.Len()))
-					return
-				}
-				c.log.Error("max retries exceeded, dropping event", "vm", ev.Namespace+"/"+ev.Name)
-			} else if stored {
-				vmEventsPublishedTotal.WithLabelValues(string(ev.Type), ev.Namespace, ev.Name).Inc()
-				vmLastEventUnixSeconds.WithLabelValues(ev.Namespace, ev.Name, string(ev.Type)).Set(float64(time.Now().UTC().Unix()))
-				c.log.Info("published vm event",
-					"vm", ev.Namespace+"/"+ev.Name,
-					"type", ev.Type,
-					"generation", ev.Generation,
-					"resourceVersion", ev.ResourceVersion)
-			} else {
-				vmEventsPublishConflictsTotal.WithLabelValues(string(ev.Type), ev.Namespace, ev.Name).Inc()
-				c.log.Debug("event skipped due to fingerprint conflict",
-					"vm", ev.Namespace+"/"+ev.Name,
-					"type", ev.Type,
-					"fingerprint", ev.EventFingerprint)
-			}
-			c.queue.Forget(ev)
-			vmEventQueueDepth.Set(float64(c.queue.Len()))
-		}()
-	}
-}
-
-func buildConfig() (*rest.Config, error) {
-	if cfg, err := rest.InClusterConfig(); err == nil {
-		return cfg, nil
-	}
-	// Local dev fallback
-	return clientcmd.BuildConfigFromFlags("", clientcmd.RecommendedHomeFile)
-}
-
-// parseWatchNamespaces supports two modes:
-// 1) all namespaces: WATCH_NAMESPACES="*" or "all" (or empty)
-// 2) explicit namespaces: WATCH_NAMESPACES="team-a,team-b"
-func parseWatchNamespaces(v string) (watchAll bool, namespaces []string) {
-	v = strings.TrimSpace(v)
-	if v == "" {
-		return true, nil
-	}
-	if v == "*" || strings.EqualFold(v, "all") {
-		return true, nil
-	}
-
-	seen := map[string]struct{}{}
-	for _, ns := range strings.Split(v, ",") {
-		ns = strings.TrimSpace(ns)
-		if ns == "" {
-			continue
-		}
-		if _, ok := seen[ns]; ok {
-			continue
-		}
-		seen[ns] = struct{}{}
-		namespaces = append(namespaces, ns)
-	}
-	if len(namespaces) == 0 {
-		return true, nil
-	}
-	return false, namespaces
-}
-
-func significantState(u *unstructured.Unstructured) string {
-	runStrategy, _, _ := unstructured.NestedString(u.Object, "spec", "runStrategy")
-	printableStatus, _, _ := unstructured.NestedString(u.Object, "status", "printableStatus")
-	phase, _, _ := unstructured.NestedString(u.Object, "status", "phase")
-	nodeName, _, _ := unstructured.NestedString(u.Object, "status", "nodeName")
-	ready := vmReadyCondition(u)
-	return strings.Join([]string{runStrategy, printableStatus, phase, nodeName, ready}, "|")
-}
-
-func vmReadyCondition(u *unstructured.Unstructured) string {
-	conds, found, err := unstructured.NestedSlice(u.Object, "status", "conditions")
-	if !found || err != nil {
-		return ""
-	}
-	for _, c := range conds {
-		m, ok := c.(map[string]interface{})
-		if !ok {
-			continue
-		}
-		typeV, _, _ := unstructured.NestedString(m, "type")
-		if typeV != "Ready" {
-			continue
-		}
-		status, _, _ := unstructured.NestedString(m, "status")
-		return status
-	}
-	return ""
-}
-
-func eventFingerprint(ev VMEvent) string {
-	raw := strings.Join([]string{
-		string(ev.Type),
-		ev.Namespace,
-		ev.Name,
-		ev.UID,
-		ev.ResourceVersion,
-		fmt.Sprintf("%d", ev.Generation),
-		ev.RunStrategy,
-		ev.PrintableStatus,
-	}, "|")
-	sum := sha256.Sum256([]byte(raw))
-	return hex.EncodeToString(sum[:])
+type config struct {
+	PostgresDSN  string
+	KafkaBrokers []string
+	KafkaTopic   string
+	KafkaGroupID string
+	KafkaMaxWait time.Duration
+	HTTPAddr     string
 }
 
 func main() {
-	logDir := getenv("LOG_DIR", "/var/log/vm-watcher")
-	podName := getenv("POD_NAME", "vm-watcher")
-	appLogPath := filepath.Join(logDir, getenv("APP_LOG_FILE", "watcher.log"))
-	eventLogPath := filepath.Join(logDir, getenv("EVENT_LOG_FILE", fmt.Sprintf("events-%s.jsonl", podName)))
-	appLogWriter, err := newRotatingFileWriter(appLogPath, getenvInt("APP_LOG_MAX_MB", 20))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	cfg, err := loadConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "init app logger: %v\n", err)
-		os.Exit(1)
-	}
-	defer appLogWriter.Close()
-	log := slog.New(slog.NewJSONHandler(io.MultiWriter(appLogWriter), nil))
-
-	watchAllNamespaces, namespaces := parseWatchNamespaces(getenv("WATCH_NAMESPACES", "default"))
-	resync, _ := time.ParseDuration(getenv("RESYNC_PERIOD", "10m"))
-
-	cfg, err := buildConfig()
-	if err != nil {
-		log.Error("kube config", "err", err)
-		os.Exit(1)
-	}
-	dyn, err := dynamic.NewForConfig(cfg)
-	if err != nil {
-		log.Error("dynamic client", "err", err)
+		log.Error("load config", "err", err)
 		os.Exit(1)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pub, err := newFilePublisher(eventLogPath, getenvInt("EVENT_LOG_MAX_MB", 100))
+	pool, err := pgxpool.New(ctx, cfg.PostgresDSN)
 	if err != nil {
-		log.Error("file publisher init failed", "err", err, "eventLogPath", eventLogPath)
+		log.Error("connect postgres", "err", err)
 		os.Exit(1)
 	}
-	log.Info("sink: file", "eventLogPath", eventLogPath)
+	defer pool.Close()
 
-	// Optionally add Kafka as a second sink.
-	// Set KAFKA_BROKERS (comma-separated) to enable; leave empty to stay file-only.
-	var publisher Publisher = pub
-	if brokerList := strings.TrimSpace(getenv("KAFKA_BROKERS", "")); brokerList != "" {
-		kafkaTopic := getenv("KAFKA_TOPIC", "vm-events")
-		brokers := strings.Split(brokerList, ",")
-		kpub := newKafkaPublisher(brokers, kafkaTopic)
-		publisher = &fanoutPublisher{publishers: []Publisher{pub, kpub}}
-		log.Info("sink: file+kafka", "brokers", brokerList, "topic", kafkaTopic)
+	if err := ensureSchema(ctx, pool); err != nil {
+		log.Error("ensure schema", "err", err)
+		os.Exit(1)
 	}
 
-	ctrl := &controller{
-		queue: workqueue.NewRateLimitingQueue(
-			workqueue.DefaultControllerRateLimiter()),
-		publisher: publisher,
-		log:       log,
-	}
-	defer ctrl.publisher.Close()
+	reader := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        cfg.KafkaBrokers,
+		Topic:          cfg.KafkaTopic,
+		GroupID:        cfg.KafkaGroupID,
+		MinBytes:       1,
+		MaxBytes:       10 * 1024 * 1024,
+		MaxWait:        cfg.KafkaMaxWait,
+		CommitInterval: 0,
+	})
+	defer reader.Close()
 
-	// One filtered factory per namespace in explicit mode; one cluster-wide
-	// factory in all-namespace mode.
-	// Note: all-namespace mode requires cluster-scoped LIST/WATCH RBAC.
-	var synced []cache.InformerSynced
-	if watchAllNamespaces {
-		f := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dyn, resync, metav1.NamespaceAll, nil)
-		inf := f.ForResource(vmGVR).Informer()
-		if _, err := inf.AddEventHandler(ctrl.handlers()); err != nil {
-			log.Error("add handler", "scope", "all-namespaces", "err", err)
-			os.Exit(1)
+	server := &http.Server{Addr: cfg.HTTPAddr, Handler: healthMux()}
+	go func() {
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Error("health server", "err", err)
 		}
-		f.Start(ctx.Done())
-		synced = append(synced, inf.HasSynced)
-		log.Info("watching", "scope", "all-namespaces", "gvr", vmGVR.String())
-	} else {
-		for _, ns := range namespaces {
-			f := dynamicinformer.NewFilteredDynamicSharedInformerFactory(dyn, resync, ns, nil)
-			inf := f.ForResource(vmGVR).Informer()
-			if _, err := inf.AddEventHandler(ctrl.handlers()); err != nil {
-				log.Error("add handler", "namespace", ns, "err", err)
-				os.Exit(1)
+	}()
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = server.Shutdown(shutdownCtx)
+	}()
+
+	log.Info("audit sink started",
+		"brokers", strings.Join(cfg.KafkaBrokers, ","),
+		"topic", cfg.KafkaTopic,
+		"groupID", cfg.KafkaGroupID,
+		"maxWait", cfg.KafkaMaxWait.String(),
+		"httpAddr", cfg.HTTPAddr)
+
+	for {
+		msg, err := reader.FetchMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				log.Info("shutting down")
+				return
 			}
-			f.Start(ctx.Done())
-			synced = append(synced, inf.HasSynced)
-			log.Info("watching", "namespace", ns, "gvr", vmGVR.String())
+			log.Error("fetch message", "err", err)
+			continue
+		}
+
+		// Cheap pre-filter: most audit traffic is not KubeVirt VM traffic.
+		if !bytes.Contains(msg.Value, []byte("virtualmachines")) {
+			if err := reader.CommitMessages(ctx, msg); err != nil {
+				log.Warn("commit after pre-filter skip", "err", err)
+			}
+			continue
+		}
+
+		ev, raw, ok := parseAuditEvent(msg.Value)
+		if !ok {
+			if err := reader.CommitMessages(ctx, msg); err != nil {
+				log.Warn("commit after malformed message", "err", err)
+			}
+			continue
+		}
+
+		if !wantEvent(ev) {
+			if err := reader.CommitMessages(ctx, msg); err != nil {
+				log.Warn("commit after filtered message", "err", err)
+			}
+			continue
+		}
+
+		if err := persist(ctx, pool, ev, raw); err != nil {
+			log.Error("persist failed; leaving offset uncommitted for redelivery", "auditID", ev.AuditID, "err", err)
+			continue
+		}
+
+		if err := reader.CommitMessages(ctx, msg); err != nil {
+			log.Warn("commit failed after persist", "auditID", ev.AuditID, "err", err)
+		}
+
+		log.Info("stored audit event",
+			"auditID", ev.AuditID,
+			"verb", ev.Verb,
+			"namespace", namespaceOf(ev),
+			"name", nameOf(ev),
+			"code", responseCodeOf(ev),
+			"partition", msg.Partition,
+			"offset", msg.Offset)
+	}
+}
+
+func loadConfig() (config, error) {
+	postgresDSN, err := requiredEnv("POSTGRES_DSN")
+	if err != nil {
+		return config{}, err
+	}
+	brokers, err := csvEnv("KAFKA_BROKERS")
+	if err != nil {
+		return config{}, err
+	}
+	maxWait, err := time.ParseDuration(getenv("KAFKA_MAX_WAIT", "500ms"))
+	if err != nil || maxWait <= 0 {
+		maxWait = 500 * time.Millisecond
+	}
+	return config{
+		PostgresDSN:  postgresDSN,
+		KafkaBrokers: brokers,
+		KafkaTopic:   getenv("KAFKA_TOPIC", "vm-audit-raw"),
+		KafkaGroupID: getenv("KAFKA_GROUP_ID", "vm-audit-sink"),
+		KafkaMaxWait: maxWait,
+		HTTPAddr:     getenv("HTTP_ADDR", ":8080"),
+	}, nil
+}
+
+func requiredEnv(k string) (string, error) {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return "", fmt.Errorf("%s is required", k)
+	}
+	return v, nil
+}
+
+func csvEnv(k string) ([]string, error) {
+	v := strings.TrimSpace(os.Getenv(k))
+	if v == "" {
+		return nil, fmt.Errorf("%s is required", k)
+	}
+	parts := strings.Split(v, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
 		}
 	}
-
-	if !cache.WaitForCacheSync(ctx.Done(), synced...) {
-		log.Error("cache sync failed")
-		os.Exit(1)
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s is required", k)
 	}
-	log.Info("caches synced, starting workers")
+	return out, nil
+}
 
-	go ctrl.runWorker(ctx)
-	go ctrl.runWorker(ctx)
+func ensureSchema(ctx context.Context, pool *pgxpool.Pool) error {
+	_, err := pool.Exec(ctx, `
+CREATE TABLE IF NOT EXISTS vm_audit_events (
+    audit_id            TEXT PRIMARY KEY,
+    verb                TEXT NOT NULL,
+    stage               TEXT NOT NULL,
+    namespace           TEXT,
+    name                TEXT,
+    uid                 TEXT,
+    resource_version    TEXT,
+    response_code       INT,
+    request_received_at TIMESTAMPTZ NOT NULL,
+    stage_timestamp     TIMESTAMPTZ NOT NULL,
+    username            TEXT,
+    request_object      JSONB,
+    response_object     JSONB,
+    raw                 JSONB NOT NULL,
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+)
+`)
+	if err != nil {
+		return err
+	}
+	if _, err = pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_vm_audit_ns_name ON vm_audit_events(namespace, name, stage_timestamp DESC)`); err != nil {
+		return err
+	}
+	_, err = pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_vm_audit_verb ON vm_audit_events(verb, stage_timestamp DESC)`)
+	return err
+}
 
-	// liveness/readiness and Prometheus metrics
+func parseAuditEvent(data []byte) (auditEvent, []byte, bool) {
+	var ev auditEvent
+	if err := json.Unmarshal(data, &ev); err == nil && ev.AuditID != "" {
+		return ev, data, true
+	}
+
+	var envelope logEnvelope
+	if err := json.Unmarshal(data, &envelope); err != nil || envelope.Message == "" {
+		return auditEvent{}, nil, false
+	}
+	inner := []byte(envelope.Message)
+	if err := json.Unmarshal(inner, &ev); err != nil || ev.AuditID == "" {
+		return auditEvent{}, nil, false
+	}
+	return ev, inner, true
+}
+
+func wantEvent(ev auditEvent) bool {
+	if ev.Stage != "ResponseComplete" || ev.ObjectRef == nil {
+		return false
+	}
+	if ev.ObjectRef.Resource != "virtualmachines" || ev.ObjectRef.APIGroup != "kubevirt.io" {
+		return false
+	}
+	code := responseCodeOf(ev)
+	return code >= 200 && code < 300
+}
+
+func persist(ctx context.Context, pool *pgxpool.Pool, ev auditEvent, raw []byte) error {
+	var namespace, name, uid, resourceVersion string
+	if ev.ObjectRef != nil {
+		namespace = ev.ObjectRef.Namespace
+		name = ev.ObjectRef.Name
+		uid = ev.ObjectRef.UID
+		resourceVersion = ev.ObjectRef.ResourceVersion
+	}
+
+	requestReceivedAt := ev.RequestReceivedTimestamp
+	if requestReceivedAt.IsZero() {
+		requestReceivedAt = time.Now().UTC()
+	}
+	stageTimestamp := ev.StageTimestamp
+	if stageTimestamp.IsZero() {
+		stageTimestamp = time.Now().UTC()
+	}
+
+	_, err := pool.Exec(ctx, `
+INSERT INTO vm_audit_events (
+    audit_id, verb, stage, namespace, name, uid, resource_version,
+    response_code, request_received_at, stage_timestamp,
+    username, request_object, response_object, raw
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+ON CONFLICT (audit_id) DO NOTHING
+`,
+		ev.AuditID,
+		ev.Verb,
+		ev.Stage,
+		namespace,
+		name,
+		uid,
+		resourceVersion,
+		responseCodeOf(ev),
+		requestReceivedAt,
+		stageTimestamp,
+		ev.User.Username,
+		jsonValue(ev.RequestObject),
+		jsonValue(ev.ResponseObject),
+		string(raw),
+	)
+	return err
+}
+
+func jsonValue(b json.RawMessage) any {
+	if len(b) == 0 || bytes.Equal(bytes.TrimSpace(b), []byte("null")) {
+		return nil
+	}
+	return string(b)
+}
+
+func responseCodeOf(ev auditEvent) int32 {
+	if ev.ResponseStatus == nil {
+		return 0
+	}
+	return ev.ResponseStatus.Code
+}
+
+func namespaceOf(ev auditEvent) string {
+	if ev.ObjectRef == nil {
+		return ""
+	}
+	return ev.ObjectRef.Namespace
+}
+
+func nameOf(ev auditEvent) string {
+	if ev.ObjectRef == nil {
+		return ""
+	}
+	return ev.ObjectRef.Name
+}
+
+func healthMux() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
 	})
-	mux.Handle("/metrics", promhttp.Handler())
-	srv := &http.Server{Addr: ":8080", Handler: mux}
-	go srv.ListenAndServe()
-
-	<-ctx.Done()
-	log.Info("shutting down")
-	ctrl.queue.ShutDown()
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	srv.Shutdown(shutdownCtx)
+	return mux
 }
 
 func getenv(k, def string) string {
-	if v := os.Getenv(k); v != "" {
+	if v := strings.TrimSpace(os.Getenv(k)); v != "" {
 		return v
 	}
 	return def
-}
-
-func getenvInt(k string, def int) int {
-	v := strings.TrimSpace(os.Getenv(k))
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n <= 0 {
-		return def
-	}
-	return n
 }

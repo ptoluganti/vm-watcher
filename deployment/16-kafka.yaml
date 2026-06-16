@@ -1,7 +1,7 @@
-# Strimzi Kafka cluster for vm-watcher events.
+# Strimzi Kafka cluster for vm-audit events.
 #
-# Prerequisites: Strimzi operator must be installed first (setup.ps1 handles this).
-# Bootstrap address: vm-events-cluster-kafka-bootstrap.vm-watcher.svc:9092
+# Prerequisites: Strimzi operator must be installed first.
+# Bootstrap address: vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092
 #
 # Single combined controller+broker node (KRaft, no ZooKeeper) — suitable for dev/CI.
 # For production: separate controller and broker pools with replicas >= 3.
@@ -12,7 +12,7 @@ metadata:
   name: combined
   namespace: vm-watcher
   labels:
-    strimzi.io/cluster: vm-events-cluster
+    strimzi.io/cluster: vm-audit-cluster
 spec:
   replicas: 1
   roles:
@@ -24,7 +24,7 @@ spec:
 apiVersion: kafka.strimzi.io/v1beta2
 kind: Kafka
 metadata:
-  name: vm-events-cluster
+  name: vm-audit-cluster
   namespace: vm-watcher
   annotations:
     strimzi.io/node-pools: enabled
@@ -50,12 +50,12 @@ spec:
 apiVersion: kafka.strimzi.io/v1beta2
 kind: KafkaTopic
 metadata:
-  name: vm-events
+  name: vm-audit-raw
   namespace: vm-watcher
   labels:
-    strimzi.io/cluster: vm-events-cluster
+    strimzi.io/cluster: vm-audit-cluster
 spec:
-  partitions: 3
+  partitions: 6
   replicas: 1
   config:
     # 7-day retention; rotate segments at 100 MB
