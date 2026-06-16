@@ -36,6 +36,8 @@
 param(
     [string]$KubevirtVersion = "",
 
+    [string]$StrimziVersion = "",
+
     [bool]$CreateExampleVM = $true,
 
     [bool]$CreateWindowsExampleVM = $false,
@@ -111,6 +113,13 @@ if ([string]::IsNullOrWhiteSpace($KubevirtVersion)) {
     Step "Resolving stable KubeVirt version from quickstart channel"
     $KubevirtVersion = (Invoke-RestMethod -Uri "https://storage.googleapis.com/kubevirt-prow/release/kubevirt/kubevirt/stable.txt").Trim()
     Ok "Using KubeVirt $KubevirtVersion"
+}
+
+if ([string]::IsNullOrWhiteSpace($StrimziVersion)) {
+    Step "Resolving latest Strimzi release from GitHub"
+    $strimziRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/strimzi/strimzi-kafka-operator/releases/latest"
+    $StrimziVersion = $strimziRelease.tag_name.TrimStart("v")
+    Ok "Using Strimzi $StrimziVersion"
 }
 
 # ── 1. Create kind cluster ───────────────────────────────────────────────────
@@ -223,6 +232,49 @@ Step "Applying manifests via kustomize"
 kubectl apply -k "$Root\deployment"
 Ok "Manifests applied"
 
+# ── 8b. Install Strimzi operator and deploy Kafka cluster ───────────────────
+Step "Installing Strimzi operator $StrimziVersion (single-namespace mode in vm-watcher)"
+$strimziUrl = "https://github.com/strimzi/strimzi-kafka-operator/releases/download/$StrimziVersion/strimzi-cluster-operator-$StrimziVersion.yaml"
+$strimziYaml = Invoke-RestMethod -Uri $strimziUrl
+# Bind the operator to the vm-watcher namespace
+$strimziYaml = $strimziYaml -replace 'namespace: myproject', 'namespace: vm-watcher'
+$strimziYaml | kubectl apply -n vm-watcher -f -
+Ok "Strimzi operator applied"
+
+Step "Waiting for Strimzi cluster operator to be ready"
+kubectl rollout status deployment/strimzi-cluster-operator -n vm-watcher --timeout=120s
+Ok "Strimzi cluster operator is ready"
+
+Step "Deploying Kafka cluster via Strimzi (KRaft, single combined node)"
+kubectl apply -f "$Root\deployment\16-kafka.yaml"
+Ok "Kafka cluster manifest applied"
+
+Step "Waiting for Kafka cluster to become ready (this may take 2-3 minutes)"
+$kafkaDeadline = (Get-Date).AddSeconds(300)
+do {
+    $ready = kubectl get kafka vm-events-cluster -n vm-watcher `
+        -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}" 2>$null
+    if ($ready -eq "True") { break }
+    Start-Sleep -Seconds 10
+} while ((Get-Date) -lt $kafkaDeadline)
+if ($ready -ne "True") {
+    Fail "Kafka cluster vm-events-cluster did not become Ready within 300s"
+}
+Ok "Kafka cluster is ready"
+
+Step "Waiting for KafkaTopic vm-events to be ready"
+$topicDeadline = (Get-Date).AddSeconds(120)
+do {
+    $topicReady = kubectl get kafkatopic vm-events -n vm-watcher `
+        -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}" 2>$null
+    if ($topicReady -eq "True") { break }
+    Start-Sleep -Seconds 5
+} while ((Get-Date) -lt $topicDeadline)
+if ($topicReady -ne "True") {
+    Fail "KafkaTopic vm-events did not become Ready within 120s"
+}
+Ok "KafkaTopic vm-events is ready"
+
 # ── 8a. Apply ingress resources after controller webhook is ready ───────────
 Step "Applying ingress resources"
 kubectl apply -f "$Root\deployment\10-ingress.yaml"
@@ -286,8 +338,7 @@ Write-Host "  echo '127.0.0.1 grafana.local prometheus.local' | sudo tee -a /etc
 Write-Host "`n  Grafana    -> http://grafana.local    (admin / admin)" -ForegroundColor Green
 Write-Host "  Prometheus -> http://prometheus.local" -ForegroundColor Green
 Write-Host "  Healthz    -> http://localhost:8080/healthz" -ForegroundColor Green
-Write-Host "  PostgreSQL -> localhost:5432  db=vmwatcher  user=vmwatcher  pass=changeme" -ForegroundColor Green
-Write-Host "`nGrafana Dashboards Available:" -ForegroundColor Yellow
+Write-Host "  PostgreSQL -> localhost:5432  db=vmwatcher  user=vmwatcher  pass=changeme" -ForegroundColor GreenWrite-Host "  Kafka      -> vm-events-cluster-kafka-bootstrap.vm-watcher.svc:9092  topic=vm-events" -ForegroundColor GreenWrite-Host "`nGrafana Dashboards Available:" -ForegroundColor Yellow
 Write-Host "  - VM Watcher - Lifecycle Overview" -ForegroundColor Green
 Write-Host "  - VM Watcher - Per Namespace Changes" -ForegroundColor Green
 Write-Host "  - VM Watcher - PostgreSQL Events" -ForegroundColor Green

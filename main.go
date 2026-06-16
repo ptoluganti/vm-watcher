@@ -20,6 +20,8 @@ import (
 	"syscall"
 	"time"
 
+	kafka "github.com/segmentio/kafka-go"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -200,6 +202,72 @@ func (p *filePublisher) Publish(_ context.Context, _, _ string, payload []byte) 
 
 func (p *filePublisher) Close() error {
 	return p.writer.Close()
+}
+
+// kafkaPublisher implements Publisher by writing each event as a Kafka message.
+// The message key is the event key (namespace/name) so Kafka routes all events
+// for the same VM to the same partition (ordered delivery per VM).
+type kafkaPublisher struct {
+	writer *kafka.Writer
+}
+
+func newKafkaPublisher(brokers []string, topic string) *kafkaPublisher {
+	w := kafka.NewWriter(kafka.WriterConfig{
+		Brokers:      brokers,
+		Topic:        topic,
+		Balancer:     &kafka.Hash{},
+		RequiredAcks: int(kafka.RequireOne),
+		// Batch small writes for throughput; the watcher is not latency-critical.
+		BatchTimeout: 5 * time.Millisecond,
+	})
+	return &kafkaPublisher{writer: w}
+}
+
+func (p *kafkaPublisher) Publish(ctx context.Context, key, _ string, payload []byte) (bool, error) {
+	err := p.writer.WriteMessages(ctx, kafka.Message{
+		Key:   []byte(key),
+		Value: payload,
+	})
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (p *kafkaPublisher) Close() error {
+	return p.writer.Close()
+}
+
+// fanoutPublisher fans out each Publish call to all underlying publishers.
+// The first non-nil error is returned; other publishers still run.
+// stored=true if at least one publisher confirms delivery.
+type fanoutPublisher struct {
+	publishers []Publisher
+}
+
+func (fp *fanoutPublisher) Publish(ctx context.Context, key, fingerprint string, payload []byte) (bool, error) {
+	var firstErr error
+	stored := false
+	for _, pub := range fp.publishers {
+		ok, err := pub.Publish(ctx, key, fingerprint, payload)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		if ok {
+			stored = true
+		}
+	}
+	return stored, firstErr
+}
+
+func (fp *fanoutPublisher) Close() error {
+	var firstErr error
+	for _, pub := range fp.publishers {
+		if err := pub.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
 }
 
 type controller struct {
@@ -509,10 +577,21 @@ func main() {
 	}
 	log.Info("sink: file", "eventLogPath", eventLogPath)
 
+	// Optionally add Kafka as a second sink.
+	// Set KAFKA_BROKERS (comma-separated) to enable; leave empty to stay file-only.
+	var publisher Publisher = pub
+	if brokerList := strings.TrimSpace(getenv("KAFKA_BROKERS", "")); brokerList != "" {
+		kafkaTopic := getenv("KAFKA_TOPIC", "vm-events")
+		brokers := strings.Split(brokerList, ",")
+		kpub := newKafkaPublisher(brokers, kafkaTopic)
+		publisher = &fanoutPublisher{publishers: []Publisher{pub, kpub}}
+		log.Info("sink: file+kafka", "brokers", brokerList, "topic", kafkaTopic)
+	}
+
 	ctrl := &controller{
 		queue: workqueue.NewRateLimitingQueue(
 			workqueue.DefaultControllerRateLimiter()),
-		publisher: pub,
+		publisher: publisher,
 		log:       log,
 	}
 	defer ctrl.publisher.Close()

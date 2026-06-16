@@ -15,6 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/segmentio/kafka-go"
 )
 
 type vmEvent struct {
@@ -54,9 +55,18 @@ type consumerConfig struct {
 	MaxBackoff       time.Duration
 }
 
+type kafkaConfig struct {
+	Brokers string // comma-separated
+	Topic   string
+	GroupID string
+}
+
+func (k kafkaConfig) enabled() bool { return strings.TrimSpace(k.Brokers) != "" }
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	cfg := loadConfig()
+	kcfg := loadKafkaConfig()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -73,7 +83,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("consumer started",
+	if kcfg.enabled() {
+		log.Info("consumer mode: kafka",
+			"brokers", kcfg.Brokers,
+			"topic", kcfg.Topic,
+			"groupID", kcfg.GroupID)
+		runKafkaConsumer(ctx, pool, cfg, kcfg, log)
+		return
+	}
+
+	log.Info("consumer mode: postgres-poll",
 		"name", cfg.Name,
 		"batchSize", cfg.BatchSize,
 		"pollInterval", cfg.PollInterval.String(),
@@ -120,6 +139,14 @@ func loadConfig() consumerConfig {
 		MaxTransitionGap: getenvDuration("MAX_TRANSITION_GAP", 30*time.Minute),
 		InitialBackoff:   getenvDuration("INITIAL_BACKOFF", 1*time.Second),
 		MaxBackoff:       getenvDuration("MAX_BACKOFF", 30*time.Second),
+	}
+}
+
+func loadKafkaConfig() kafkaConfig {
+	return kafkaConfig{
+		Brokers: getenv("KAFKA_BROKERS", ""),
+		Topic:   getenv("KAFKA_TOPIC", "vm-events"),
+		GroupID: getenv("KAFKA_GROUP_ID", "vm-event-consumer"),
 	}
 }
 
@@ -350,6 +377,153 @@ func parseEventKey(eventKey, fallbackNS, fallbackName string) (string, string) {
 		return parts[0], parts[1]
 	}
 	return fallbackNS, fallbackName
+}
+
+// runKafkaConsumer replaces the PostgreSQL-polling loop when KAFKA_BROKERS is set.
+// It reads from a Kafka consumer group, processes each event into PostgreSQL state
+// tables, then commits the Kafka offset (at-least-once delivery).
+func runKafkaConsumer(ctx context.Context, pool *pgxpool.Pool, cfg consumerConfig, kcfg kafkaConfig, log *slog.Logger) {
+	brokers := strings.Split(kcfg.Brokers, ",")
+	r := kafka.NewReader(kafka.ReaderConfig{
+		Brokers:        brokers,
+		Topic:          kcfg.Topic,
+		GroupID:        kcfg.GroupID,
+		MinBytes:       1,
+		MaxBytes:       10 * 1024 * 1024, // 10 MB
+		CommitInterval: 0,                // manual commit after processing
+	})
+	defer r.Close()
+
+	backoff := cfg.InitialBackoff
+	for {
+		select {
+		case <-ctx.Done():
+			log.Info("kafka consumer stopped")
+			return
+		default:
+		}
+
+		msg, err := r.FetchMessage(ctx)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			log.Error("fetch kafka message", "err", err, "retryIn", backoff.String())
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > cfg.MaxBackoff {
+				backoff = cfg.MaxBackoff
+			}
+			continue
+		}
+		backoff = cfg.InitialBackoff
+
+		if err := processKafkaMessage(ctx, pool, cfg, msg, log); err != nil {
+			log.Error("process kafka message", "offset", msg.Offset, "partition", msg.Partition, "err", err)
+			// Do not commit — message will be redelivered after group rebalance/restart.
+			continue
+		}
+
+		if err := r.CommitMessages(ctx, msg); err != nil {
+			log.Error("commit kafka offset", "offset", msg.Offset, "partition", msg.Partition, "err", err)
+		} else {
+			log.Debug("committed kafka offset", "partition", msg.Partition, "offset", msg.Offset)
+		}
+	}
+}
+
+// processKafkaMessage deserialises a vm-events Kafka message and applies the
+// same state-machine logic as the PostgreSQL-poll path (vm_state upsert +
+// vm_state_transitions insert on status change).
+func processKafkaMessage(ctx context.Context, pool *pgxpool.Pool, cfg consumerConfig, msg kafka.Message, log *slog.Logger) error {
+	var ev vmEvent
+	if err := json.Unmarshal(msg.Value, &ev); err != nil {
+		return fmt.Errorf("decode kafka message partition=%d offset=%d: %w", msg.Partition, msg.Offset, err)
+	}
+	if strings.TrimSpace(ev.EventFingerprint) == "" {
+		return fmt.Errorf("missing event fingerprint partition=%d offset=%d", msg.Partition, msg.Offset)
+	}
+
+	eventKey := strings.TrimSpace(string(msg.Key))
+	if eventKey == "" {
+		eventKey = ev.Namespace + "/" + ev.Name
+	}
+
+	tx, err := pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Idempotency: skip if this fingerprint was already processed by this consumer.
+	res, err := tx.Exec(ctx,
+		`INSERT INTO consumer_processed_events(consumer_name, event_fingerprint, event_id, event_key)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT (consumer_name, event_fingerprint) DO NOTHING`,
+		cfg.Name, ev.EventFingerprint, msg.Offset, eventKey)
+	if err != nil {
+		return err
+	}
+	if res.RowsAffected() == 0 {
+		log.Debug("duplicate kafka message skipped",
+			"consumer", cfg.Name, "partition", msg.Partition, "offset", msg.Offset, "key", eventKey)
+		return tx.Commit(ctx)
+	}
+
+	ns, name := parseEventKey(eventKey, ev.Namespace, ev.Name)
+	currStatus := strings.TrimSpace(ev.PrintableStatus)
+	if currStatus == "" {
+		currStatus = "UNKNOWN"
+	}
+	currType := strings.TrimSpace(ev.Type)
+	if currType == "" {
+		currType = "UNKNOWN"
+	}
+
+	var prevStatus string
+	var prevSeen time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT last_status, last_seen_at FROM vm_state WHERE event_key=$1`, eventKey).Scan(&prevStatus, &prevSeen)
+	hasPrev := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
+	}
+
+	if hasPrev && prevStatus != currStatus {
+		anomaly, reason := detectTransitionAnomaly(prevStatus, currStatus, currType, prevSeen, msg.Time, cfg.MaxTransitionGap)
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO vm_state_transitions(consumer_name, event_key, from_status, to_status, event_type, event_id, transition_at, anomaly, reason)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+			cfg.Name, eventKey, prevStatus, currStatus, currType, msg.Offset, msg.Time, anomaly, reason); err != nil {
+			return err
+		}
+	}
+
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO vm_state(event_key, namespace, name, last_event_id, last_event_type, last_status, last_run_strategy, last_seen_at, total_events)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 1)
+		 ON CONFLICT (event_key)
+		 DO UPDATE SET
+			last_event_id    = EXCLUDED.last_event_id,
+			last_event_type  = EXCLUDED.last_event_type,
+			last_status      = EXCLUDED.last_status,
+			last_run_strategy = EXCLUDED.last_run_strategy,
+			last_seen_at     = EXCLUDED.last_seen_at,
+			total_events     = vm_state.total_events + 1,
+			updated_at       = NOW()`,
+		eventKey, ns, name, msg.Offset, currType, currStatus, ev.RunStrategy, msg.Time); err != nil {
+		return err
+	}
+
+	log.Info("kafka event processed",
+		"consumer", cfg.Name, "key", eventKey,
+		"type", currType, "status", currStatus,
+		"partition", msg.Partition, "offset", msg.Offset)
+	return tx.Commit(ctx)
 }
 
 func getenv(k, def string) string {

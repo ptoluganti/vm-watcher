@@ -49,6 +49,15 @@ spec:
               value: "1s"
             - name: MAX_BACKOFF
               value: "30s"
+            # ── kafka consumer (Strimzi) ────────────────────────────────────────
+            # When KAFKA_BROKERS is set the consumer reads from Kafka instead
+            # of polling PostgreSQL.  Still writes state to PostgreSQL.
+            - name: KAFKA_BROKERS
+              value: "vm-events-cluster-kafka-bootstrap.vm-watcher.svc:9092"
+            - name: KAFKA_TOPIC
+              value: "vm-events"
+            - name: KAFKA_GROUP_ID
+              value: "vm-event-consumer"
           resources:
             requests:
               cpu: 50m

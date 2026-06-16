@@ -45,6 +45,12 @@ spec:
             # ── misc ─────────────────────────────────────────────────────────
             - name: RESYNC_PERIOD
               value: "10m"
+            # ── kafka sink (Strimzi) ─────────────────────────────────────────────
+            # Leave KAFKA_BROKERS empty to disable Kafka and use file-only mode.
+            - name: KAFKA_BROKERS
+              value: "vm-events-cluster-kafka-bootstrap.vm-watcher.svc:9092"
+            - name: KAFKA_TOPIC
+              value: "vm-events"
           ports:
             - containerPort: 8080
           livenessProbe:
