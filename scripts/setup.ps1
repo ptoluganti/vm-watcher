@@ -16,6 +16,11 @@
 .PARAMETER KubevirtVersion
     KubeVirt version tag to use. Defaults to the stable quickstart version.
 
+.PARAMETER StrimziVersion
+    Strimzi release to install. Pinned because each Strimzi release runs only a
+    few Kafka versions and deployment/16-kafka.yaml names one of them: change
+    both together. Pass "" for the latest GitHub release.
+
 .PARAMETER CreateExampleVM
     Apply deployment/05-example-vm.yaml after the watcher is ready.
 
@@ -37,7 +42,7 @@
 param(
     [string]$KubevirtVersion = "",
 
-    [string]$StrimziVersion = "",
+    [string]$StrimziVersion = "1.3.0",
 
     [bool]$CreateExampleVM = $true,
 
@@ -58,6 +63,9 @@ $Root = Split-Path -Parent $PSScriptRoot
 function Step { param([string]$Msg) Write-Host "`n==> $Msg" -ForegroundColor Cyan }
 function Ok   { param([string]$Msg) Write-Host "    $Msg" -ForegroundColor Green }
 function Fail { param([string]$Msg) Write-Host "    ERROR: $Msg" -ForegroundColor Red; exit 1 }
+# $ErrorActionPreference does not stop the script when a native command
+# (kind, kubectl, docker) fails, so check its exit code.
+function Check { param([string]$What) if ($LASTEXITCODE -ne 0) { Fail "$What failed (exit code $LASTEXITCODE)" } }
 
 function Wait-ForKubeVirtPhase {
     param(
@@ -67,7 +75,7 @@ function Wait-ForKubeVirtPhase {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        $phase = kubectl get kubevirt.kubevirt.io/kubevirt -n kubevirt kubevirt -o jsonpath="{.status.phase}" 2>$null
+        $phase = kubectl get kubevirt.kubevirt.io kubevirt -n kubevirt -o jsonpath="{.status.phase}" 2>$null
         if ($phase -eq $ExpectedPhase) {
             return
         }
@@ -85,7 +93,7 @@ function Wait-ForCdiPhase {
 
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     do {
-        $phase = kubectl get cdi.cdi.kubevirt.io/cdi cdi -o jsonpath="{.status.phase}" 2>$null
+        $phase = kubectl get cdi.cdi.kubevirt.io cdi -o jsonpath="{.status.phase}" 2>$null
         if ($phase -eq $ExpectedPhase) {
             return
         }
@@ -130,6 +138,7 @@ if ($existing) {
     Ok "Cluster already exists — skipping create"
 } else {
     kind create cluster --config "$Root\kind-config.yaml"
+    Check "kind create cluster"
     Ok "Cluster created"
 }
 
@@ -137,16 +146,23 @@ if ($existing) {
 Step "Installing KubeVirt operator ($KubevirtVersion)"
 $operatorUrl = "https://github.com/kubevirt/kubevirt/releases/download/$KubevirtVersion/kubevirt-operator.yaml"
 kubectl apply -f $operatorUrl
+Check "kubectl apply $operatorUrl"
 Ok "KubeVirt operator applied"
 
 Step "Installing KubeVirt custom resource"
 $crUrl = "https://github.com/kubevirt/kubevirt/releases/download/$KubevirtVersion/kubevirt-cr.yaml"
 kubectl apply -f $crUrl
+Check "kubectl apply $crUrl"
 Ok "KubeVirt CR applied"
 
+# KubeVirt 1.9 turns on its Beta ImageVolume feature gate by default. It needs
+# the Kubernetes ImageVolume feature, which kind's Kubernetes 1.32 has off, and
+# without it every containerDisk VM crash-loops ("container-disk: no such file
+# or directory"). Turned off, KubeVirt uses its classic containerDisk path.
 Step "Enabling emulation for kind"
-kubectl -n kubevirt patch kubevirt kubevirt --type=merge --patch '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true}}}}'
-Ok "KubeVirt emulation enabled"
+kubectl -n kubevirt patch kubevirt kubevirt --type=merge --patch '{"spec":{"configuration":{"developerConfiguration":{"useEmulation":true,"disabledFeatureGates":["ImageVolume"]}}}}'
+Check "Enabling KubeVirt emulation"
+Ok "KubeVirt emulation enabled, ImageVolume feature gate off"
 
 Step "Waiting for KubeVirt to reach phase Deployed"
 Wait-ForKubeVirtPhase -ExpectedPhase "Deployed" -TimeoutSeconds 1200
@@ -182,36 +198,43 @@ Step "Building Docker image $ImageTag (audit sink)"
 Push-Location $Root
 docker build -t $ImageTag .
 Pop-Location
+Check "docker build $ImageTag"
 Ok "Audit sink image built"
 
 Step "Building Docker image vm-watcher:dev (VM watcher)"
 Push-Location $Root
 docker build -f ".\Dockerfile.watcher" -t "vm-watcher:dev" .
 Pop-Location
+Check "docker build vm-watcher:dev"
 Ok "Watcher image built"
 
 Step "Building Docker image vm-event-consumer:dev (event consumer)"
 Push-Location $Root
 docker build -f ".\Dockerfile.consumer" -t "vm-event-consumer:dev" .
 Pop-Location
+Check "docker build vm-event-consumer:dev"
 Ok "Consumer image built"
 
 # ── 4. Load images into kind ─────────────────────────────────────────────────
 Step "Loading $ImageTag into kind cluster"
 kind load docker-image $ImageTag --name vm-watcher-dev
+Check "kind load docker-image $ImageTag"
 Ok "Audit sink image loaded"
 
 Step "Loading vm-watcher:dev into kind cluster"
 kind load docker-image "vm-watcher:dev" --name vm-watcher-dev
+Check "kind load docker-image vm-watcher:dev"
 Ok "Watcher image loaded"
 
 Step "Loading vm-event-consumer:dev into kind cluster"
 kind load docker-image "vm-event-consumer:dev" --name vm-watcher-dev
+Check "kind load docker-image vm-event-consumer:dev"
 Ok "Consumer image loaded"
 
 # ── 7. Install nginx ingress controller ─────────────────────────────────────
 Step "Installing nginx ingress controller (kind provider)"
 kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/kind/deploy.yaml
+Check "kubectl apply ingress-nginx"
 Ok "nginx ingress applied"
 
 Step "Waiting for nginx ingress controller to be ready"
@@ -219,28 +242,47 @@ kubectl wait --namespace ingress-nginx `
     --for=condition=ready pod `
     --selector=app.kubernetes.io/component=controller `
     --timeout=120s
+Check "Waiting for the nginx ingress controller"
 Ok "nginx ingress controller is ready"
 
 # ── 8. Install Strimzi operator before applying Kafka manifests ─────────────
+# The operator's namespaced resources are applied to vm-watcher, which has to
+# exist first on a new cluster.
+Step "Creating namespaces"
+kubectl apply -f "$Root\deployment\00-namespace.yaml"
+Check "kubectl apply 00-namespace.yaml"
+Ok "Namespaces applied"
+
 Step "Installing Strimzi operator $StrimziVersion (single-namespace mode in vm-watcher)"
 $strimziUrl = "https://github.com/strimzi/strimzi-kafka-operator/releases/download/$StrimziVersion/strimzi-cluster-operator-$StrimziVersion.yaml"
 $strimziYaml = Invoke-RestMethod -Uri $strimziUrl
 # Bind the operator to the vm-watcher namespace
 $strimziYaml = $strimziYaml -replace 'namespace: myproject', 'namespace: vm-watcher'
 $strimziYaml | kubectl apply -n vm-watcher -f -
+Check "kubectl apply Strimzi $StrimziVersion"
 Ok "Strimzi operator applied"
 
 Step "Waiting for Strimzi cluster operator to be ready"
 kubectl rollout status deployment/strimzi-cluster-operator -n vm-watcher --timeout=120s
+Check "Waiting for the Strimzi cluster operator"
 Ok "Strimzi cluster operator is ready"
 
 # ── 9. Apply manifests ───────────────────────────────────────────────────────
 Step "Applying manifests via kustomize"
 kubectl apply -k "$Root\deployment"
+Check "kubectl apply -k deployment"
 Ok "Manifests applied"
+
+# The images keep their :dev tag, so on a reused cluster an unchanged pod
+# template would leave the old pods, and the old code, running.
+Step "Restarting the app deployments on the images just loaded"
+kubectl rollout restart deployment/audit-sink deployment/vm-watcher deployment/vm-event-consumer -n vm-watcher
+Check "kubectl rollout restart"
+Ok "Deployments restarted"
 
 Step "Deploying Kafka cluster via Strimzi (KRaft, single combined node)"
 kubectl apply -f "$Root\deployment\16-kafka.yaml"
+Check "kubectl apply 16-kafka.yaml"
 Ok "Kafka cluster manifest applied"
 
 Step "Waiting for Kafka cluster to become ready (this may take 2-3 minutes)"
@@ -274,6 +316,7 @@ foreach ($topic in "vm-audit-raw","vm-events") {
 # ── 8a. Apply ingress resources after controller webhook is ready ───────────
 Step "Applying ingress resources"
 kubectl apply -f "$Root\deployment\10-ingress.yaml"
+Check "kubectl apply 10-ingress.yaml"
 Ok "Ingress resources applied"
 
 # ── 9. Wait for rollout ───────────────────────────────────────────────────────
@@ -281,6 +324,7 @@ Ok "Ingress resources applied"
 Step "Waiting for deployments to become ready"
 foreach ($deploy in "postgres","audit-sink","vm-watcher","vm-event-consumer") {
     kubectl rollout status deployment/$deploy -n vm-watcher --timeout=120s
+    Check "Waiting for deployment $deploy"
     Ok "$deploy is ready"
 }
 
@@ -289,6 +333,7 @@ $watchNamespaces = kubectl get deploy vm-watcher -n vm-watcher -o jsonpath="{.sp
 if (Is-AllNamespaceWatch -Value $watchNamespaces) {
     Step "Applying cluster-wide RBAC for all-namespace watch mode"
     kubectl apply -f "$Root\deployment\01-rbac-cluster.yaml"
+    Check "kubectl apply 01-rbac-cluster.yaml"
     Ok "Cluster RBAC applied"
 } else {
     Ok "Namespace-list mode detected (WATCH_NAMESPACES='$watchNamespaces') - cluster RBAC not needed"
@@ -298,6 +343,7 @@ if (Is-AllNamespaceWatch -Value $watchNamespaces) {
 if ($CreateExampleVM) {
     Step "Applying example VirtualMachine manifest"
     kubectl apply -f "$Root\deployment\05-example-vm.yaml"
+    Check "kubectl apply 05-example-vm.yaml"
     Ok "Example VirtualMachine applied in namespace team-a"
 }
 
