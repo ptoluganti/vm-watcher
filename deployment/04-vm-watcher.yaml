@@ -1,3 +1,8 @@
+# Live VM state lane: watches KubeVirt VirtualMachines and publishes each
+# change to Kafka topic vm-events, keyed by namespace/name.
+#
+# Needs get/list/watch on virtualmachines in every watched namespace
+# (01-rbac.yaml), or 01-rbac-cluster.yaml for WATCH_NAMESPACES="*".
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,116 +11,81 @@ metadata:
   labels:
     app: vm-watcher
 spec:
-  replicas: 1   # safe to scale >1; sidecars dedupe via vm_events(event_fingerprint) unique index
+  # One replica. A second one would publish every change twice; the consumer
+  # absorbs that (fingerprint dedupe, resourceVersion order) but gains nothing.
+  replicas: 1
   selector:
-    matchLabels: { app: vm-watcher }
+    matchLabels:
+      app: vm-watcher
   template:
     metadata:
-      labels: { app: vm-watcher }
+      labels:
+        app: vm-watcher
     spec:
-      nodeSelector:
-        node-role.kubernetes.io/control-plane: ""
-      tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
       serviceAccountName: vm-watcher
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
-        seccompProfile: { type: RuntimeDefault }
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: watcher
           image: vm-watcher:dev
           imagePullPolicy: Never
           env:
-            # ── namespaces to watch ──────────────────────────────────────────
             - name: WATCH_NAMESPACES
-              value: "team-a,team-b"   # use "*" or "all" for every namespace
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: LOG_DIR
-              value: "/var/log/vm-watcher"
-            - name: APP_LOG_MAX_MB
-              value: "20"
-            - name: EVENT_LOG_MAX_MB
-              value: "100"
-            # ── misc ─────────────────────────────────────────────────────────
-            - name: RESYNC_PERIOD
-              value: "10m"
-            # ── kafka sink (Strimzi) ─────────────────────────────────────────────
-            # Leave KAFKA_BROKERS empty to disable Kafka and use file-only mode.
+              value: "team-a,team-b"   # "*" or "all" for every namespace
             - name: KAFKA_BROKERS
-              value: "vm-events-cluster-kafka-bootstrap.vm-watcher.svc:9092"
+              value: "vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092"
             - name: KAFKA_TOPIC
               value: "vm-events"
+            # Upper bound on events per Kafka write. A lone change is written at once.
+            - name: BATCH_MAX_SIZE
+              value: "100"
+            - name: HTTP_ADDR
+              value: ":8080"
           ports:
-            - containerPort: 8080
-          livenessProbe:
-            httpGet: { path: /healthz, port: 8080 }
-            initialDelaySeconds: 5
+            - name: http
+              containerPort: 8080
+          # Ready once the informer caches have synced.
           readinessProbe:
-            httpGet: { path: /healthz, port: 8080 }
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
             initialDelaySeconds: 5
-          volumeMounts:
-            - name: vm-watcher-logs
-              mountPath: /var/log/vm-watcher
           resources:
-            requests: { cpu: 50m, memory: 64Mi }
-            limits:   { cpu: 500m, memory: 256Mi }
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            capabilities: { drop: ["ALL"] }
-        - name: log-publisher-sidecar
-          image: vm-log-sidecar:dev
-          imagePullPolicy: Never
-          env:
-            - name: POSTGRES_DSN
-              valueFrom:
-                secretKeyRef:
-                  name: postgres-secret
-                  key: dsn
-            - name: LOG_DIR
-              value: "/var/log/vm-watcher"
-            - name: EVENT_LOG_GLOB
-              value: ""
-            - name: POLL_INTERVAL
-              value: "5s"
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: PUBLISHER_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-          volumeMounts:
-            - name: vm-watcher-logs
-              mountPath: /var/log/vm-watcher
-          resources:
-            requests: { cpu: 50m, memory: 64Mi }
-            limits:   { cpu: 500m, memory: 256Mi }
-          securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities: { drop: ["ALL"] }
-      volumes:
-        - name: vm-watcher-logs
-          persistentVolumeClaim:
-            claimName: vm-watcher-logs
+            capabilities:
+              drop: ["ALL"]
 ---
+# /healthz, /readyz and /metrics. kind-config.yaml maps the NodePort to localhost:8080.
 apiVersion: v1
 kind: Service
 metadata:
   name: vm-watcher
   namespace: vm-watcher
+  labels:
+    app: vm-watcher
 spec:
-  selector: { app: vm-watcher }
+  selector:
+    app: vm-watcher
   ports:
-    - port: 8080
-      targetPort: 8080
+    - name: http
+      port: 8080
+      targetPort: http
       nodePort: 30080
   type: NodePort

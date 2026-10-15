@@ -1,3 +1,5 @@
+# Live VM state lane: applies the watcher's changes from Kafka topic vm-events
+# to PostgreSQL tables vm_state and vm_state_transitions.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -15,12 +17,6 @@ spec:
       labels:
         app: vm-event-consumer
     spec:
-      nodeSelector:
-        node-role.kubernetes.io/control-plane: ""
-      tolerations:
-        - key: node-role.kubernetes.io/control-plane
-          operator: Exists
-          effect: NoSchedule
       serviceAccountName: vm-watcher
       securityContext:
         runAsNonRoot: true
@@ -37,27 +33,41 @@ spec:
                 secretKeyRef:
                   name: postgres-secret
                   key: dsn
-            - name: CONSUMER_NAME
-              value: vm-event-consumer-1
-            - name: BATCH_SIZE
-              value: "200"
-            - name: POLL_INTERVAL
-              value: "2s"
-            - name: MAX_TRANSITION_GAP
-              value: "30m"
-            - name: INITIAL_BACKOFF
-              value: "1s"
-            - name: MAX_BACKOFF
-              value: "30s"
-            # ── kafka consumer (Strimzi) ────────────────────────────────────────
-            # When KAFKA_BROKERS is set the consumer reads from Kafka instead
-            # of polling PostgreSQL.  Still writes state to PostgreSQL.
             - name: KAFKA_BROKERS
-              value: "vm-events-cluster-kafka-bootstrap.vm-watcher.svc:9092"
+              value: "vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092"
             - name: KAFKA_TOPIC
               value: "vm-events"
             - name: KAFKA_GROUP_ID
               value: "vm-event-consumer"
+            - name: KAFKA_MAX_WAIT
+              value: "500ms"
+            # Offsets are committed in the background at this interval ("0" = after
+            # every batch, synchronously). Replays after a crash are deduplicated.
+            - name: KAFKA_COMMIT_INTERVAL
+              value: "1s"
+            # Upper bound on messages applied per PostgreSQL transaction.
+            - name: BATCH_MAX_SIZE
+              value: "500"
+            # Dedupe scope in consumer_processed_events.
+            - name: CONSUMER_NAME
+              value: "vm-event-consumer-1"
+            - name: MAX_TRANSITION_GAP
+              value: "30m"
+            - name: HTTP_ADDR
+              value: ":8080"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
           resources:
             requests:
               cpu: 50m
@@ -70,3 +80,19 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+---
+# Exposes /metrics (consumer lag, end-to-end event lag, batch sizes) to Prometheus.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vm-event-consumer
+  namespace: vm-watcher
+  labels:
+    app: vm-event-consumer
+spec:
+  selector:
+    app: vm-event-consumer
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

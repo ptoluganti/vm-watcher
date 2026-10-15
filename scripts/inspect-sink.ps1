@@ -29,21 +29,21 @@ if ($SinkType -eq "auto") {
 
 switch ($SinkType) {
     "postgres" {
-        Step "Reading latest VM events from PostgreSQL"
+        Step "Reading the latest VM states from PostgreSQL (vm_state)"
         $pod = kubectl get pod -n $Namespace -l app=postgres -o jsonpath="{.items[0].metadata.name}"
         if ([string]::IsNullOrWhiteSpace($pod)) {
             Fail "PostgreSQL pod not found"
         }
-        kubectl exec -n $Namespace $pod -- psql -U vmwatcher -d vmwatcher -c "select id, event_key, payload->>'type' as type, payload->>'timestamp' as timestamp from vm_events order by id desc limit $Tail;"
+        kubectl exec -n $Namespace $pod -- psql -U vmwatcher -d vmwatcher -c "select event_key, last_event_type as type, last_status as status, last_resource_version as resource_version, last_seen_at from vm_state order by last_seen_at desc limit $Tail;"
         break
     }
     "kafka" {
-        Step "Reading latest VM events from Kafka"
-        $pod = kubectl get pod -n $Namespace -l app=kafka -o jsonpath="{.items[0].metadata.name}"
+        Step "Reading VM events from Kafka topic vm-events"
+        $pod = kubectl get pod -n $Namespace -l strimzi.io/name=vm-audit-cluster-kafka -o jsonpath="{.items[0].metadata.name}"
         if ([string]::IsNullOrWhiteSpace($pod)) {
-            Fail "Kafka pod not found"
+            Fail "Kafka broker pod not found"
         }
-        kubectl exec -n $Namespace $pod -- bash -lc "timeout 15 kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic vm-events --from-beginning --max-messages $Tail"
+        kubectl exec -n $Namespace $pod -- /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic vm-events --from-beginning --max-messages $Tail --timeout-ms 15000 --property print.key=true
         break
     }
     default {

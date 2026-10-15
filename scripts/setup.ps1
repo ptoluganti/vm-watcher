@@ -6,10 +6,11 @@
     1. Creates (or reuses) a kind cluster from kind-config.yaml
     2. Installs KubeVirt using the kind quickstart flow
     2b. Optionally installs CDI for DataVolume-based image imports
-    3. Builds the vm-watcher Docker image
-    4. Loads the image into the kind cluster (no registry needed)
-    5. Patches the image reference in the deployment manifest
-    6. Applies all manifests in deployment/ via kustomize
+    3. Builds the Docker images: vm-audit-sink (audit lane), vm-watcher and
+       vm-event-consumer (live VM state lane)
+    4. Loads the images into the kind cluster (no registry needed)
+    5. Installs Strimzi and applies all manifests in deployment/ via kustomize
+    6. Waits for Kafka, both topics, and the deployments
     7. Optionally creates an example VirtualMachine in a watched namespace
 
 .PARAMETER KubevirtVersion
@@ -176,12 +177,18 @@ if ($CreateWindowsDataVolume) {
     kubectl get pods -n cdi
 }
 
-# ── 3. Build Docker images (audit sink + legacy helpers) ─────────────────────
+# ── 3. Build Docker images (audit lane + live VM state lane) ─────────────────
 Step "Building Docker image $ImageTag (audit sink)"
 Push-Location $Root
 docker build -t $ImageTag .
 Pop-Location
 Ok "Audit sink image built"
+
+Step "Building Docker image vm-watcher:dev (VM watcher)"
+Push-Location $Root
+docker build -f ".\Dockerfile.watcher" -t "vm-watcher:dev" .
+Pop-Location
+Ok "Watcher image built"
 
 Step "Building Docker image vm-event-consumer:dev (event consumer)"
 Push-Location $Root
@@ -189,24 +196,18 @@ docker build -f ".\Dockerfile.consumer" -t "vm-event-consumer:dev" .
 Pop-Location
 Ok "Consumer image built"
 
-Step "Building Docker image vm-log-sidecar:dev (log publisher sidecar)"
-Push-Location $Root
-docker build -f ".\Dockerfile.log-sidecar" -t "vm-log-sidecar:dev" .
-Pop-Location
-Ok "Log sidecar image built"
-
 # ── 4. Load images into kind ─────────────────────────────────────────────────
 Step "Loading $ImageTag into kind cluster"
 kind load docker-image $ImageTag --name vm-watcher-dev
+Ok "Audit sink image loaded"
+
+Step "Loading vm-watcher:dev into kind cluster"
+kind load docker-image "vm-watcher:dev" --name vm-watcher-dev
 Ok "Watcher image loaded"
 
 Step "Loading vm-event-consumer:dev into kind cluster"
 kind load docker-image "vm-event-consumer:dev" --name vm-watcher-dev
 Ok "Consumer image loaded"
-
-Step "Loading vm-log-sidecar:dev into kind cluster"
-kind load docker-image "vm-log-sidecar:dev" --name vm-watcher-dev
-Ok "Log sidecar image loaded"
 
 # ── 7. Install nginx ingress controller ─────────────────────────────────────
 Step "Installing nginx ingress controller (kind provider)"
@@ -255,18 +256,20 @@ if ($ready -ne "True") {
 }
 Ok "Kafka cluster is ready"
 
-Step "Waiting for KafkaTopic vm-audit-raw to be ready"
-$topicDeadline = (Get-Date).AddSeconds(120)
-do {
-    $topicReady = kubectl get kafkatopic vm-audit-raw -n vm-watcher `
-        -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}" 2>$null
-    if ($topicReady -eq "True") { break }
-    Start-Sleep -Seconds 5
-} while ((Get-Date) -lt $topicDeadline)
-if ($topicReady -ne "True") {
-    Fail "KafkaTopic vm-audit-raw did not become Ready within 120s"
+foreach ($topic in "vm-audit-raw","vm-events") {
+    Step "Waiting for KafkaTopic $topic to be ready"
+    $topicDeadline = (Get-Date).AddSeconds(120)
+    do {
+        $topicReady = kubectl get kafkatopic $topic -n vm-watcher `
+            -o jsonpath="{.status.conditions[?(@.type=='Ready')].status}" 2>$null
+        if ($topicReady -eq "True") { break }
+        Start-Sleep -Seconds 5
+    } while ((Get-Date) -lt $topicDeadline)
+    if ($topicReady -ne "True") {
+        Fail "KafkaTopic $topic did not become Ready within 120s"
+    }
+    Ok "KafkaTopic $topic is ready"
 }
-Ok "KafkaTopic vm-audit-raw is ready"
 
 # ── 8a. Apply ingress resources after controller webhook is ready ───────────
 Step "Applying ingress resources"
@@ -274,18 +277,12 @@ kubectl apply -f "$Root\deployment\10-ingress.yaml"
 Ok "Ingress resources applied"
 
 # ── 9. Wait for rollout ───────────────────────────────────────────────────────
+# The audit sink and the event consumer create their PostgreSQL tables on start.
 Step "Waiting for deployments to become ready"
-foreach ($deploy in "postgres","vm-watcher","prometheus","grafana","vm-event-consumer") {
+foreach ($deploy in "postgres","audit-sink","vm-watcher","vm-event-consumer") {
     kubectl rollout status deployment/$deploy -n vm-watcher --timeout=120s
     Ok "$deploy is ready"
 }
-
-# ── 9a. Ensure vm_events schema supports idempotent inserts ─────────────────
-Step "Applying vm_events schema migration (fingerprint + unique index)"
-$postgresPod = kubectl get pod -n vm-watcher -l app=postgres -o jsonpath="{.items[0].metadata.name}"
-$schemaSql = "CREATE TABLE IF NOT EXISTS vm_events (id BIGSERIAL PRIMARY KEY, event_key TEXT NOT NULL, event_fingerprint TEXT NOT NULL, payload JSONB NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()); ALTER TABLE vm_events ADD COLUMN IF NOT EXISTS event_fingerprint TEXT; CREATE UNIQUE INDEX IF NOT EXISTS ux_vm_events_fingerprint ON vm_events(event_fingerprint);"
-kubectl exec -n vm-watcher $postgresPod -- psql -U vmwatcher -d vmwatcher -v ON_ERROR_STOP=1 -c $schemaSql
-Ok "vm_events schema migration applied"
 
 # ── 9b. Optional cluster RBAC for all-namespace mode ────────────────────────
 $watchNamespaces = kubectl get deploy vm-watcher -n vm-watcher -o jsonpath="{.spec.template.spec.containers[0].env[?(@.name=='WATCH_NAMESPACES')].value}"
@@ -332,20 +329,24 @@ Write-Host "`n  Grafana    -> http://grafana.local    (admin / admin)" -Foregrou
 Write-Host "  Prometheus -> http://prometheus.local" -ForegroundColor Green
 Write-Host "  Healthz    -> http://localhost:8080/healthz" -ForegroundColor Green
 Write-Host "  PostgreSQL -> localhost:5432  db=vmwatcher  user=vmwatcher  pass=changeme" -ForegroundColor Green
-Write-Host "  Kafka      -> vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092  topic=vm-audit-raw" -ForegroundColor Green
+Write-Host "  Kafka      -> vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092  topics=vm-audit-raw,vm-events" -ForegroundColor Green
 Write-Host "`nGrafana Dashboards Available:" -ForegroundColor Yellow
 Write-Host "  - Audit Pipeline - Recent VM Mutations" -ForegroundColor Green
 Write-Host "  - Audit Pipeline - Kafka Lag" -ForegroundColor Green
 Write-Host "  - Audit Pipeline - PostgreSQL Events" -ForegroundColor Green
 Write-Host "`nUseful commands:" -ForegroundColor Yellow
 Write-Host "kubectl logs -n vm-watcher deploy/audit-sink -f" -ForegroundColor Yellow
+Write-Host "kubectl logs -n vm-watcher deploy/vm-watcher -f" -ForegroundColor Yellow
+Write-Host "kubectl logs -n vm-watcher deploy/vm-event-consumer -f" -ForegroundColor Yellow
 Write-Host "kubectl get pods -n vm-watcher -w" -ForegroundColor Yellow
 Write-Host ".\scripts\inspect-sink.ps1 -SinkType postgres -Tail 20" -ForegroundColor Yellow
-Write-Host "`nConsumer state inspection (SQL):" -ForegroundColor Yellow
-Write-Host "# VM state snapshot" -ForegroundColor DarkYellow
-Write-Host "SELECT audit_id, verb, namespace, name, response_code, stage_timestamp FROM vm_audit_events ORDER BY stage_timestamp DESC LIMIT 20;" -ForegroundColor DarkYellow
+Write-Host "`nState inspection (SQL):" -ForegroundColor Yellow
+Write-Host "# Live VM state lane: current state of every VM" -ForegroundColor DarkYellow
+Write-Host "SELECT event_key, last_status, last_event_type, last_resource_version, last_seen_at FROM vm_state ORDER BY last_seen_at DESC;" -ForegroundColor DarkYellow
+Write-Host "# Audit lane: who did what" -ForegroundColor DarkYellow
+Write-Host "SELECT audit_id, verb, namespace, name, username, response_code, stage_timestamp FROM vm_audit_events ORDER BY stage_timestamp DESC LIMIT 20;" -ForegroundColor DarkYellow
 Write-Host "# Kafka consumer health" -ForegroundColor DarkYellow
-Write-Host "kubectl get deploy audit-sink -n vm-watcher" -ForegroundColor DarkYellow
+Write-Host "kubectl get deploy audit-sink vm-watcher vm-event-consumer -n vm-watcher" -ForegroundColor DarkYellow
 Write-Host "`nOptional Windows VM setup:" -ForegroundColor Yellow
 Write-Host "kubectl apply -f deployment/12-example-windows-datavolume.yaml" -ForegroundColor Yellow
 Write-Host "kubectl get dv -n team-b windows-rootdisk -o wide" -ForegroundColor Yellow

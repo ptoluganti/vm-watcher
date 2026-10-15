@@ -4,9 +4,12 @@ kind: Kustomization
 resources:
   - 00-namespace.yaml
   - 01-rbac.yaml
-  - 03-log-storage.yaml
   - 02-postgres.yaml
   - 16-kafka.yaml
+  # Audit lane: who did what (~1-3 s)
   - 05-audit-sink.yaml
+  # Live VM state lane: current state of every VM (~0.1-0.5 s)
+  - 04-vm-watcher.yaml
+  - 13-vm-event-consumer.yaml
   - 14-postgres-backup-cronjob.yaml
   - 15-postgres-backup-verify-cronjob.yaml

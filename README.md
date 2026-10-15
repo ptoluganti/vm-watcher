@@ -1,14 +1,21 @@
 # vm-watcher
 
-KubeVirt VM audit pipeline for OpenShift/Kubernetes: kube-apiserver audit logs flow through Vector into Kafka, and a Go sink stores authoritative VirtualMachine mutations in PostgreSQL with dedupe and manual offset commits.
+KubeVirt VM change pipeline for OpenShift/Kubernetes. Two lanes feed PostgreSQL through one Strimzi Kafka cluster:
+
+- **Live VM state lane (~0.1–0.5 s).** An informer watches `VirtualMachine` objects and publishes every change to Kafka topic `vm-events`. A consumer keeps the current state of each VM in `vm_state` and its status changes in `vm_state_transitions`.
+- **Audit lane (~1–3 s).** kube-apiserver audit logs flow through the OpenShift `ClusterLogForwarder` into Kafka topic `vm-audit-raw`. The audit sink stores every VM write request, including the user who made it, in `vm_audit_events`.
+
+Watch events do not say who made a change, so the audit lane stays the record of who did what. Join the lanes on namespace/name and resourceVersion to get both; see [Joining the two lanes](#joining-the-two-lanes).
 
 ## What this project includes
 
-- Go audit sink (`main.go`, image `vm-audit-sink`)
+- VM watcher (`cmd/vm-watcher`, image `vm-watcher`): informer → Kafka `vm-events`
+- VM event consumer (`cmd/vm-event-consumer`, image `vm-event-consumer`): Kafka `vm-events` → `vm_state`, `vm_state_transitions`
+- Audit sink (`main.go`, image `vm-audit-sink`): Kafka `vm-audit-raw` → `vm_audit_events`
 - kube-apiserver audit log forwarding via OpenShift `ClusterLogForwarder`, filtered to VM write requests on the collector
-- Strimzi Kafka durable buffer (`vm-audit-raw`)
-- PostgreSQL sink (`vm_audit_events` table) via `auditID` dedupe, plus `vm_audit_dead_letters` for events PostgreSQL rejects
-- Health and Prometheus metrics endpoints (`/healthz`, `/metrics`)
+- Strimzi Kafka (`vm-audit-raw`, `vm-events`) as the durable replay buffer for both lanes
+- Dead-letter tables for messages PostgreSQL rejects (`vm_audit_dead_letters`, `vm_event_dead_letters`)
+- Health and Prometheus metrics endpoints (`/healthz`, `/metrics`) on every component
 - Optional Grafana/Prometheus overlays if you still want them for other workloads
 
 ## Prerequisites
@@ -31,20 +38,274 @@ This will:
 1. Create/reuse kind cluster (`vm-watcher-dev`)
 2. Install KubeVirt
 3. Install ingress-nginx
-4. Build/load `vm-audit-sink:dev`
-5. Install Strimzi, deploy PostgreSQL, Kafka, and the audit sink
+4. Build/load `vm-audit-sink:dev`, `vm-watcher:dev` and `vm-event-consumer:dev`
+5. Install Strimzi, deploy PostgreSQL, Kafka (topics `vm-audit-raw` and `vm-events`), the audit sink, the watcher and the consumer
 
-The audit forwarder is OpenShift-only and is not applied by the script. On OpenShift (Logging 6.x), apply it separately:
+The audit forwarder is OpenShift-only and is not applied by the script, so on kind only the live VM state lane carries data. On OpenShift (Logging 6.x), apply it separately:
 
 ```powershell
 kubectl apply -f deployment/04-clf.yaml
 ```
 
-## Design document
+## The two lanes
+
+```mermaid
+flowchart LR
+  U[User or automation] --> API[kube-apiserver]
+
+  subgraph live ["Live VM state lane (~0.1-0.5 s)"]
+    W[vm-watcher<br/>informer] --> K1[(Kafka<br/>vm-events)]
+    K1 --> C[vm-event-consumer]
+    C --> S[(vm_state<br/>vm_state_transitions)]
+  end
+
+  subgraph audit ["Audit lane (~1-3 s)"]
+    L[audit log file] --> F[ClusterLogForwarder<br/>VM writes only]
+    F --> K2[(Kafka<br/>vm-audit-raw)]
+    K2 --> A[audit sink]
+    A --> E[(vm_audit_events)]
+  end
+
+  API -- watch --> W
+  API -- audit event --> L
+  S -.-|namespace/name + resourceVersion| E
+```
+
+| | Live VM state lane | Audit lane |
+|---|---|---|
+| Source | Watch on `virtualmachines.kubevirt.io` | kube-apiserver audit log |
+| Change → PostgreSQL | ~0.1–0.5 s | ~1–3 s |
+| Answers | What state is each VM in, and when did it change? | Who made each write request, and what did they send? |
+| Names the user | No | Yes (`username`) |
+| Coverage | Every published change. Changes made while the watcher is down collapse into the current state when it restarts | Every successful write request |
+| Kafka topic | `vm-events` | `vm-audit-raw` |
+| PostgreSQL | `vm_state`, `vm_state_transitions` | `vm_audit_events` |
+| Runs on | Any Kubernetes with KubeVirt | OpenShift (Logging 6.x) |
+
+### Expected latency
+
+- **Live VM state lane: ~0.1–0.5 s** from the API server committing a change to the row in `vm_state`. The watch delivers the change within tens of milliseconds. The watcher writes it to Kafka within the 5 ms `BatchTimeout` plus the acknowledgement, and the consumer applies it in one PostgreSQL transaction.
+- **Audit lane: ~1–3 s.** The API server writes the audit event to a log file on the control-plane node, and the collector reads that file and ships it to Kafka before the sink sees it. That path cannot go below about 1 s.
+
+| Metric | Lane | What it shows |
+|---|---|---|
+| `vm_event_publish_lag_seconds` | live | Informer delivered the change → Kafka acknowledged it |
+| `vm_event_consumer_event_lag_seconds` | live | Watcher observed the change → `vm_state` committed |
+| `audit_sink_event_lag_seconds` | audit | API server finished the request (`stageTimestamp`) → row stored |
+
+p95 for each lane in PromQL:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(vm_event_consumer_event_lag_seconds_bucket[5m])))
+histogram_quantile(0.95, sum by (le) (rate(audit_sink_event_lag_seconds_bucket[5m])))
+```
+
+The live lane histograms start when the watcher receives the change, so they leave out the API server → watcher hop (typically tens of milliseconds).
+
+### Joining the two lanes
+
+A watch event carries the object as the API server stored it, including `metadata.resourceVersion`. For a `create`, `update` or `patch`, the audit event's `responseObject` is that same object. So:
+
+> namespace/name + `metadata.resourceVersion` from the watch object = `objectRef` namespace/name + `responseObject.metadata.resourceVersion` in the audit event
+
+Where each lane keeps the key:
+
+| Where | Namespace/name | resourceVersion |
+|---|---|---|
+| Kafka `vm-events` message | message key `namespace/name` | value field `resourceVersion` |
+| `vm_state` (latest change per VM) | `namespace`, `name` | `last_resource_version` |
+| `vm_state_transitions` (status changes) | `event_key` (`namespace/name`) | `resource_version` |
+| `vm_audit_events` | `namespace`, `name` | `response_object -> 'metadata' ->> 'resourceVersion'` |
+
+`vm_audit_events.resource_version` is not the join key: it is `objectRef.resourceVersion`, the version the client sent with the request (empty for most requests).
+
+Current state of each VM, and who made the request that produced it:
+
+```sql
+SELECT s.namespace, s.name, s.last_status, s.last_resource_version, s.last_seen_at,
+       a.username, a.verb, a.stage_timestamp
+FROM vm_state s
+LEFT JOIN vm_audit_events a
+  ON  a.namespace = s.namespace
+  AND a.name = s.name
+  AND a.response_object -> 'metadata' ->> 'resourceVersion' = s.last_resource_version
+ORDER BY s.last_seen_at DESC;
+```
+
+One VM's history from both lanes, newest first:
+
+```sql
+SELECT 'state' AS lane, transition_at AS at, resource_version,
+       from_status || ' -> ' || to_status AS what, NULL::text AS username
+FROM vm_state_transitions
+WHERE event_key = 'team-a/fedora-testvm'
+UNION ALL
+SELECT 'audit', stage_timestamp, response_object -> 'metadata' ->> 'resourceVersion',
+       verb || COALESCE('/' || NULLIF(subresource, ''), ''), username
+FROM vm_audit_events
+WHERE namespace = 'team-a' AND name = 'fedora-testvm'
+ORDER BY at DESC
+LIMIT 50;
+```
+
+Things to know:
+
+- **Audit profile.** `responseObject` is only in the audit event if the cluster's APIServer audit profile logs request bodies (`WriteRequestBodies` or `AllRequestBodies`); the collector filter cannot add it. Without it, match on namespace/name and time instead. To set it on OpenShift: `oc patch apiserver cluster --type=merge -p '{"spec":{"audit":{"profile":"WriteRequestBodies"}}}'`.
+- **Status changes come from KubeVirt.** Changes such as `Starting` → `Running` are written by KubeVirt's controllers, so their resourceVersion joins to an audit event from a KubeVirt service account, not a person. A person's start, stop, restart or migrate goes through `subresources.kubevirt.io` (`subresource` column). That request returns no VM to join on, so match it on namespace/name and the next watch event, usually within a second.
+- **Deletes.** KubeVirt puts a finalizer on each VM, so a delete first only sets `deletionTimestamp`. The `delete` audit event's `responseObject` is the VM at that resourceVersion, which the watcher publishes as a `MODIFIED` event. The watch `DELETED` comes later, when KubeVirt removes its finalizer.
+- **Filtered updates.** The watcher publishes `MODIFIED` only when the spec (`metadata.generation`), labels, annotations, deletion, printable status or Ready condition change, and filters KubeVirt's status bookkeeping. A person's create, update or patch changes one of those, so it has a matching watch event. A write that changes nothing gets an audit event but no new resourceVersion.
+
+## Live VM state lane
+
+### How it works
+
+1. `vm-watcher` runs a `VirtualMachine` informer per watched namespace (`WATCH_NAMESPACES`, or `*` for the whole cluster).
+2. Each add, significant update and delete becomes a JSON `VMEvent`, queued in the order the watch delivered it.
+3. A single publisher writes whatever is queued (up to `BATCH_MAX_SIZE`) to `vm-events` with the kafka-go `Writer`. Messages are keyed by `namespace/name` and the `Hash` balancer sends each VM to one partition, so each VM's changes stay in order. `BatchTimeout` is 5 ms instead of kafka-go's 1 s default, and `RequiredAcks` waits for all in-sync replicas.
+4. `vm-event-consumer` reads `vm-events` in micro-batches. It applies each batch in one PostgreSQL transaction: dedupe in `consumer_processed_events`, upsert `vm_state`, and insert into `vm_state_transitions` when the status changes, with anomaly flags.
+
+### Event payload
+
+```json
+{
+  "type": "MODIFIED",
+  "namespace": "team-a",
+  "name": "fedora-testvm",
+  "uid": "a1b2c3d4-...",
+  "resourceVersion": "184523",
+  "generation": 4,
+  "runStrategy": "Always",
+  "status": "Running",
+  "eventFingerprint": "9f2c...",
+  "timestamp": "2026-10-15T10:04:00.123Z",
+  "labels": {},
+  "annotations": {},
+  "spec": {},
+  "statusObject": {},
+  "disks": []
+}
+```
+
+`timestamp` is when the watcher observed the change. `eventFingerprint` is a hash of type, namespace, name, uid, resourceVersion, generation, run strategy and status, and identifies the change for deduplication.
+
+### Delivery behavior
+
+Watcher:
+
+- A failed Kafka write is retried with backoff until Kafka acknowledges it. Nothing newer is written in the meantime, so each VM's order holds. While Kafka is down the queue fills and the informer buffers further changes in memory; nothing is dropped.
+- On start, the informer lists every VM and publishes `ADDED` for each, so the consumer converges on the current state after a restart or outage. Changes in between are not recovered by this lane; the audit lane has them.
+- On shutdown it stops the informers and keeps writing queued events for up to 10 s.
+- An event over 1 MB (Kafka's default message size limit) is dropped and counted in `vm_events_dropped_total`, since it could never be written.
+- Run one replica. A second one publishes every change twice; the consumer absorbs that but gains nothing.
+
+Consumer:
+
+- Offsets are committed only after the batch is stored, in the background every `KAFKA_COMMIT_INTERVAL`. A replay after a crash is a no-op because `eventFingerprint` is deduplicated in `consumer_processed_events`.
+- If PostgreSQL is unavailable, the consumer retries with backoff and does not move past the failed batch. (Committing a later offset would silently skip it.)
+- A message that is not a usable VM event (bad JSON, no `eventFingerprint`, no namespace/name), or one PostgreSQL rejects as invalid (SQLSTATE class 22, 23 or 54), is written to `vm_event_dead_letters` with the error and the raw Kafka payload, and ingest continues.
+- **Newest wins.** An event whose resourceVersion is lower than the one stored for the VM is recorded as processed but does not change `vm_state`, and is counted as `stale`. This keeps a late duplicate, from a watcher retry or rollout, from moving a VM backwards. Kubernetes calls resourceVersions opaque, but they come from etcd's revision counter and only grow. After restoring etcd from a backup they start lower, so clear the stored versions with `UPDATE vm_state SET last_resource_version = NULL;`.
+
+### Watcher settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `WATCH_NAMESPACES` | `default` | Comma-separated namespaces, or `*`/`all` for every namespace (needs `01-rbac-cluster.yaml`) |
+| `KAFKA_BROKERS` | required | Comma-separated bootstrap brokers |
+| `KAFKA_TOPIC` | `vm-events` | Topic to publish to |
+| `BATCH_MAX_SIZE` | `100` | Most events per Kafka write |
+| `RETRY_INITIAL_BACKOFF` | `200ms` | First wait after a failed Kafka write; doubles on each retry |
+| `RETRY_MAX_BACKOFF` | `10s` | Longest wait between retries |
+| `RESYNC_PERIOD` | `0` | Informer resync interval; `0` turns resyncs off (they only re-deliver unchanged objects) |
+| `HTTP_ADDR` | `:8080` | Address for `/healthz`, `/readyz` (informer caches synced) and `/metrics` |
+
+### Consumer settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `POSTGRES_DSN` | required | PostgreSQL connection string |
+| `KAFKA_BROKERS` | required | Comma-separated bootstrap brokers |
+| `KAFKA_TOPIC` | `vm-events` | Topic to consume |
+| `KAFKA_GROUP_ID` | `vm-event-consumer` | Consumer group shared by all replicas |
+| `KAFKA_MAX_WAIT` | `500ms` | Broker long-poll timeout while idle |
+| `KAFKA_COMMIT_INTERVAL` | `1s` | Background offset commit interval; `0` commits synchronously after every batch |
+| `BATCH_MAX_SIZE` | `500` | Most messages applied per transaction |
+| `CONSUMER_NAME` | `vm-event-consumer-1` | Dedupe scope in `consumer_processed_events` |
+| `MAX_TRANSITION_GAP` | `30m` | A status change after a longer gap is flagged `large_transition_gap` |
+| `RETRY_INITIAL_BACKOFF` | `200ms` | First wait after a failed PostgreSQL write; doubles on each retry |
+| `RETRY_MAX_BACKOFF` | `10s` | Longest wait between retries |
+| `HTTP_ADDR` | `:8080` | Address for `/healthz` and `/metrics` |
+
+### Metrics
+
+Watcher (`vm-watcher` scrape job in `06-prometheus-config.yaml`):
+
+| Metric | What it shows |
+|---|---|
+| `vm_event_publish_lag_seconds` | Histogram: informer delivered the change → Kafka acknowledged it |
+| `vm_events_observed_total{type,namespace}` | Changes queued for Kafka |
+| `vm_events_published_total{type,namespace}` | Changes acknowledged by Kafka |
+| `vm_events_publish_failures_total` | Kafka writes that failed and were retried |
+| `vm_events_filtered_total{reason,namespace}` | `same_resource_version` (resync) and `insignificant_modified` updates not published |
+| `vm_events_dropped_total` | Changes too large for Kafka |
+| `vm_event_queue_depth` | Changes waiting for the next write |
+| `vm_last_event_unix_seconds{namespace,type}` | Time of the last change Kafka acknowledged |
+
+Consumer (`vm-event-consumer` scrape job):
+
+| Metric | What it shows |
+|---|---|
+| `vm_event_consumer_event_lag_seconds` | Histogram: watcher observed the change → `vm_state` committed |
+| `vm_event_consumer_lag_messages{partition}` | Messages behind the newest one in each partition, as of the last handled message |
+| `vm_event_consumer_messages_total{result}` | `applied`, `stale`, `duplicate`, `dead_lettered` |
+| `vm_event_consumer_batch_size` | Messages per batch |
+| `vm_event_consumer_write_retries_total` | PostgreSQL writes that failed and were retried; rising means ingest is stalled |
+
+### Build and deploy
+
+```powershell
+docker build -f .\Dockerfile.watcher -t vm-watcher:dev .
+docker build -f .\Dockerfile.consumer -t vm-event-consumer:dev .
+kind load docker-image vm-watcher:dev --name vm-watcher-dev
+kind load docker-image vm-event-consumer:dev --name vm-watcher-dev
+kubectl apply -k .\deployment
+kubectl rollout status deployment/vm-watcher -n vm-watcher --timeout=120s
+kubectl rollout status deployment/vm-event-consumer -n vm-watcher --timeout=120s
+kubectl logs -n vm-watcher deploy/vm-watcher --tail=100
+kubectl logs -n vm-watcher deploy/vm-event-consumer --tail=100
+```
+
+### Useful queries
+
+```sql
+-- current state of every VM
+select event_key, last_status, last_event_type, last_resource_version, last_seen_at, total_events
+from vm_state
+order by last_seen_at desc;
+
+-- latest transitions and anomalies
+select event_key, from_status, to_status, resource_version, anomaly, reason, transition_at
+from vm_state_transitions
+order by transition_at desc
+limit 50;
+
+-- messages the consumer could not apply
+select kafka_partition, kafka_offset, event_key, error, created_at
+from vm_event_dead_letters
+order by created_at desc;
+```
+
+Or:
+
+```powershell
+.\scripts\inspect-sink.ps1 -SinkType postgres -Tail 20   # vm_state
+.\scripts\inspect-sink.ps1 -SinkType kafka -Tail 20      # raw vm-events messages
+```
+
+## Audit lane
 
 ### Architecture
 
-This deployment uses an audit-log write path:
+This lane uses an audit-log write path:
 
 1. kube-apiserver emits authoritative audit events for every mutating VM request.
 2. OpenShift `ClusterLogForwarder` (Logging 6.x) forwards only VirtualMachine write requests from the kube-apiserver audit log to Kafka topic `vm-audit-raw`. A `kubeAPIAudit` filter on the collector drops everything else (reads, other resources, node auditd, OpenShift/OAuth API servers) before it reaches Kafka.
@@ -228,153 +489,6 @@ kubectl exec -n vm-watcher $pod -- sh -lc "pg_dump -U vmwatcher -d vmwatcher > /
 kubectl cp "vm-watcher/$pod:/tmp/vmwatcher.sql" .\vmwatcher.sql
 ```
 
-## How watcher works (overview)
-
-The watcher listens for KubeVirt VirtualMachine API events, transforms each event into a JSON payload, and then processes it in two paths:
-
-1. Data path (event persistence): writes each VM event to rotating JSONL files; sidecar publishes into PostgreSQL table `vm_events`
-2. Observability path (telemetry): updates Prometheus counters/gauges that Grafana dashboards query
-
-### Event flow diagram
-
-```mermaid
-flowchart LR
-  A[User or Automation\nCreate/Patch/Delete VM] --> B[Kubernetes API Server]
-  B --> C[KubeVirt VM Resource\nvirtualmachines.kubevirt.io]
-  C --> D[vm-watcher informer]
-  D --> E[Rate-limited work queue]
-  E --> F[Watcher serializer\nJSON payload]
-
-  F --> FS[(Shared log storage\n/events-<pod>.jsonl)]
-  FS --> SC[Sidecar publisher\noffset checkpoint + upsert]
-  SC --> G[(PostgreSQL\nvm_events table)]
-  F --> H[Prometheus metrics endpoint\n/metrics]
-
-  H --> I[Prometheus scrape job]
-  I --> J[Grafana\nPrometheus dashboards]
-  G --> K[Grafana\nPostgreSQL dashboard]
-
-  G --> L[scripts/inspect-sink.ps1]
-```
-
-### What gets logged for each event
-
-- Event key: `namespace/name` (for example, `team-a/fedora-testvm`)
-- Event type: `ADDED`, `MODIFIED`, or `DELETED`
-- VM status (when present): for example `Starting`, `Running`, `Stopping`, `Stopped`
-- Timestamp: RFC3339/UTC event timestamp from watcher payload
-
-### Event processing behavior
-
-- Informer receives KubeVirt VM events and enqueues a key
-- Worker dequeues keys and fetches current VM object state
-- Worker emits JSON payload and writes one row into PostgreSQL
-- Worker updates Prometheus metrics for event totals, queue depth, and last seen event time
-- Grafana dashboards visualize both live metric trends and persisted SQL history
-
-### Retry and error path (sequence)
-
-```mermaid
-sequenceDiagram
-  participant I as Informer
-  participant Q as Work Queue
-  participant W as Worker
-  participant DB as PostgreSQL
-  participant M as Metrics
-
-  I->>Q: enqueue namespace/name key
-  Q->>W: deliver key
-  W->>DB: insert vm_events row
-
-  alt Write succeeds
-    W->>M: increment published counter
-    W->>Q: forget key (ack)
-  else Write fails
-    W->>M: increment publish failure counter
-    W->>Q: requeue with rate limit
-    Q-->>W: retry later (backoff)
-  end
-```
-
-## Why this watcher design
-
-This design is strong for VM lifecycle auditing because it separates event collection, durable storage, and observability into independent components.
-
-### Pros
-
-- Durable history: every processed event is stored in PostgreSQL, so dashboards are not only based on volatile time-series data.
-- Backpressure handling: rate-limited queue smooths bursts and provides retry/backoff on sink failures.
-- Operational visibility: Prometheus metrics expose queue depth, throughput, and failure counts for quick diagnosis.
-- Clear integration points: Grafana can query both Prometheus (rates/trends) and PostgreSQL (exact event history).
-- Namespace scalability: can watch one, many, or all namespaces without changing core logic.
-
-### Cons
-
-- At-least-once behavior: retries can create duplicate logical updates unless dedupe rules are added downstream.
-- Event granularity noise: many `MODIFIED` events can be generated for one VM lifecycle action.
-- More moving parts: PostgreSQL + Prometheus + Grafana + ingress adds setup and operational overhead.
-- Current model keying: `event_key` groups by `namespace/name` but does not include a unique event id from K8s.
-- Postgres sink coupling: code still carries legacy sink logic in some places if not fully cleaned to Postgres-only.
-
-### When this is the better choice
-
-- You need both real-time monitoring and historical auditability.
-- You expect intermittent sink failures and want built-in retry with controlled backoff.
-- You want simple SQL access for troubleshooting in addition to time-series dashboards.
-
-## Recommended improvements
-
-### 1. Event deduplication strategy
-
-Goal: reduce duplicate logical updates caused by retries or noisy update streams.
-
-- Add a deterministic event fingerprint, for example hash of:
-  - `event_key`
-  - `payload.type`
-  - `payload.status`
-  - rounded/normalized event timestamp bucket
-- Store fingerprint in PostgreSQL and enforce uniqueness with an index.
-- Keep raw payload, but mark duplicates for analytics clarity.
-
-Example index shape:
-
-```sql
-alter table vm_events add column if not exists event_fingerprint text;
-create unique index if not exists ux_vm_events_fingerprint on vm_events(event_fingerprint);
-```
-
-### 2. Idempotent DB insert pattern
-
-Goal: make retries safe and remove duplicate rows from transient sink failures.
-
-- Use PostgreSQL upsert semantics:
-  - `INSERT ... ON CONFLICT DO NOTHING`
-  - or `ON CONFLICT (...) DO UPDATE` when enriching existing rows
-- Track write outcome in metrics:
-  - inserted
-  - conflict-skipped
-  - failed
-
-This keeps queue retry behavior while preventing duplicate persistence.
-
-### 3. MODIFIED event noise filtering
-
-Goal: keep meaningful lifecycle transitions and suppress low-value churn.
-
-- Compare current vs last-seen relevant VM fields only, for example:
-  - runStrategy
-  - printable status/phase
-  - node assignment
-  - ready condition
-- Ignore updates where only non-essential metadata changed.
-- Optionally add debounce window (for example 1-2 seconds per `event_key`) to collapse bursts.
-
-Suggested approach:
-
-- Maintain small in-memory cache keyed by `event_key` with last significant state hash.
-- Publish/store only when the significant-state hash changes.
-- Expose metric for filtered events (for visibility into suppression rate).
-
 ## Access
 
 Add hosts entries (run as Administrator):
@@ -387,7 +501,7 @@ Open:
 
 - Grafana: `http://grafana.local` (admin/admin)
 - Prometheus: `http://prometheus.local`
-- Health: `http://localhost:8080/healthz`
+- Health: `http://localhost:8080/healthz` (vm-watcher)
 
 If needed on an existing cluster without host port mapping:
 
@@ -432,89 +546,14 @@ kubectl get dv -n team-b windows-rootdisk -w
 kubectl patch vm windows-testvm -n team-b --type=merge -p '{"spec":{"runStrategy":"Always"}}'
 ```
 
-## Inspect events in PostgreSQL
-
-```powershell
-.\scripts\inspect-sink.ps1 -SinkType postgres -Tail 20
-```
-
-Direct query:
-
-```powershell
-$pod = kubectl get pod -n vm-watcher -l app=postgres -o jsonpath="{.items[0].metadata.name}"
-kubectl exec -n vm-watcher $pod -- psql -U vmwatcher -d vmwatcher -c "select id,event_key,payload->>'type' as type,payload->>'status' as status,created_at from vm_events order by id desc limit 20;"
-```
-
-## Prometheus metrics exposed by watcher
-
-- `vm_events_observed_total`
-- `vm_events_published_total`
-- `vm_events_publish_failures_total`
-- `vm_events_publish_conflicts_total`
-- `vm_events_filtered_total`
-- `vm_event_queue_depth`
-- `vm_last_event_unix_seconds`
-
 ## Dashboards
 
-Grafana folder: **VM Watcher**
+The Grafana overlay (`06`–`09` manifests) is not part of `kustomization.yaml`. Its folder **VM Watcher** has:
 
-- VM Watcher - Lifecycle Overview
-- VM Watcher - Per Namespace Changes
-- VM Watcher - PostgreSQL Events
-
-## Event consumer (state + transitions + anomaly logic)
-
-This repo now includes a PostgreSQL consumer at `cmd/vm-event-consumer`.
-
-Consumer responsibilities:
-
-- Incremental checkpointing (`consumer_offsets`) so it resumes from the last processed `vm_events.id`
-- Idempotent processing (`consumer_processed_events`) keyed by `event_fingerprint`
-- VM latest-state projection (`vm_state`) for fast "current status" queries
-- Transition history (`vm_state_transitions`) with anomaly flags and reasons
-- Backoff/retry loop for transient database issues
-
-### Build and run locally
-
-```powershell
-go run .\cmd\vm-event-consumer
-```
-
-### Build container and deploy to cluster
-
-```powershell
-docker build -f .\Dockerfile.consumer -t vm-event-consumer:dev .
-kind load docker-image vm-event-consumer:dev --name vm-watcher-dev
-kubectl apply -f .\deployment\13-vm-event-consumer.yaml
-kubectl rollout status deployment/vm-event-consumer -n vm-watcher --timeout=120s
-kubectl logs -n vm-watcher deploy/vm-event-consumer --tail=100
-```
-
-### Useful consumer queries
-
-```sql
--- last consumed offset per consumer
-select consumer_name, last_event_id, updated_at
-from consumer_offsets;
-
--- current VM state projection
-select event_key, last_status, last_event_type, last_seen_at, total_events
-from vm_state
-order by updated_at desc;
-
--- latest transitions and anomalies
-select event_key, from_status, to_status, anomaly, reason, transition_at
-from vm_state_transitions
-order by transition_at desc
-limit 50;
-
--- sidecar offsets (file checkpoint state)
-select publisher_id, file_path, offset, updated_at
-from vm_log_offsets
-order by updated_at desc
-limit 50;
-```
+- VM Watcher - Lifecycle Overview (watcher metrics)
+- VM Watcher - Per Namespace Changes (watcher metrics)
+- VM Watcher - PostgreSQL Events (reads the `vm_events` table of the retired file-and-sidecar path, so it stays empty)
+- VM Watcher - Consumer State & Anomalies (`vm_state`, `vm_state_transitions`; its Consumer Lag panel also reads the retired tables, so use `vm_event_consumer_lag_messages` instead)
 
 ## Important notes
 

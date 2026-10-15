@@ -1,4 +1,6 @@
-# Strimzi Kafka cluster for vm-audit events.
+# Strimzi Kafka cluster for both VM lanes:
+#   vm-audit-raw  audit lane: kube-apiserver audit events from the ClusterLogForwarder
+#   vm-events     live VM state lane: VirtualMachine changes from the vm-watcher
 #
 # Prerequisites: Strimzi operator must be installed first.
 # Bootstrap address: vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092
@@ -62,4 +64,23 @@ spec:
     retention.ms: "604800000"
     segment.bytes: "104857600"
     # Compact+delete: keep the last state per key after retention expires
+    cleanup.policy: delete
+---
+# One message per VirtualMachine change, keyed by namespace/name: each VM's
+# changes stay in order on one partition. Changing the partition count moves
+# keys to other partitions, so set it before the watcher first writes.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: vm-events
+  namespace: vm-watcher
+  labels:
+    strimzi.io/cluster: vm-audit-cluster
+spec:
+  partitions: 6
+  replicas: 1
+  config:
+    # 7-day replay window for rebuilding vm_state; rotate segments at 100 MB
+    retention.ms: "604800000"
+    segment.bytes: "104857600"
     cleanup.policy: delete
