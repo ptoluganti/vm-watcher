@@ -28,24 +28,27 @@ operator. See [Design notes](#design-notes) for why.
 
 ## Architecture
 
+```mermaid
+flowchart TB
+  api["kube-apiserver"] -->|watch| informers["Informers<br/>per namespace,<br/>or cluster-wide"]
+  informers -->|"VMEvent,<br/>in watch order"| queue["Bounded queue"]
+  queue -->|micro-batches| publisher["Single publisher<br/>kafka-go Writer"]
+  publisher -->|"keyed by<br/>namespace/name"| topic[("Kafka topic<br/>vm-events")]
+
+  classDef source fill:#f3f4f6,stroke:#6b7280,color:#111827
+  classDef liveNode fill:#dbeafe,stroke:#2563eb,color:#0c1f44
+  class api source
+  class informers,queue,publisher,topic liveNode
 ```
-                 ┌───────────────────────────────┐
-  K8s API <──────┤ namespace-scoped informers     │   (one factory per namespace)
-                 │ add / update / delete handlers │
-                 └───────────────┬───────────────┘
-                                 │ VMEvent, in watch order
-                                 ▼
-                       ┌──────────────────┐
-                       │ bounded queue     │   full: handlers wait, the informer
-                       └─────────┬────────┘   buffers further changes in memory
-                                 │ micro-batches (BATCH_MAX_SIZE)
-                                 ▼
-                       ┌──────────────────┐
-                       │ single publisher  │   kafka-go Writer: Hash balancer,
-                       └─────────┬────────┘   BatchTimeout 5ms, RequireAll acks
-                                 ▼
-                         Kafka topic vm-events
-```
+
+- **Informers:** one factory per namespace, or one cluster-wide informer for
+  `WATCH_NAMESPACES=*`. Their add, update and delete handlers turn each watch
+  event into a `VMEvent`.
+- **Bounded queue:** when it is full, the handlers wait and the informer buffers
+  further changes in memory.
+- **Single publisher:** writes micro-batches of up to `BATCH_MAX_SIZE` events
+  with a kafka-go Writer: Hash balancer on the `namespace/name` key,
+  `BatchTimeout` 5 ms, `RequireAll` acks.
 
 One publisher, not a worker pool: two workers could write two changes to the
 same VM out of order.
