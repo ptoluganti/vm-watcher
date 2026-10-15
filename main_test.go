@@ -60,12 +60,14 @@ func (r *fakeReader) committed() (calls int, maxOffset int64) {
 // fakeStore behaves like the PostgreSQL store: a batch is all or nothing and
 // duplicate auditIDs are reported as not inserted.
 type fakeStore struct {
-	failures []error          // returned by the next insertEvents calls, in order
-	down     error            // returned by every insertEvents call when set
-	reject   map[string]error // fails any batch that contains this auditID
-	stored   map[string]bool
-	dead     []string
-	attempts int
+	failures      []error          // returned by the next insertEvents calls, in order
+	deadFailures  []error          // returned by the next deadLetter calls, in order
+	down          error            // returned by every insertEvents call when set
+	reject        map[string]error // fails any batch that contains this auditID
+	stored        map[string]bool
+	dead          []string
+	attempts      int
+	schemaCreated int
 }
 
 func newFakeStore() *fakeStore {
@@ -96,7 +98,17 @@ func (s *fakeStore) insertEvents(_ context.Context, rows []eventRow) ([]bool, er
 }
 
 func (s *fakeStore) deadLetter(_ context.Context, _ kafka.Message, auditID string, _ error) error {
+	if len(s.deadFailures) > 0 {
+		err := s.deadFailures[0]
+		s.deadFailures = s.deadFailures[1:]
+		return err
+	}
 	s.dead = append(s.dead, auditID)
+	return nil
+}
+
+func (s *fakeStore) createSchema(context.Context) error {
+	s.schemaCreated++
 	return nil
 }
 
@@ -244,8 +256,49 @@ func TestHandleBatchRetriesOutage(t *testing.T) {
 	if len(st.dead) != 0 {
 		t.Errorf("dead-lettered %v during an outage, want none", st.dead)
 	}
+	if st.schemaCreated != 0 {
+		t.Errorf("schema created %d times for an outage, want 0", st.schemaCreated)
+	}
 	if calls, maxOffset := r.committed(); calls != 1 || maxOffset != 7 {
 		t.Errorf("commits = %d up to offset %d, want 1 up to offset 7", calls, maxOffset)
+	}
+}
+
+// PostgreSQL restarted on a new, empty volume after the sink created its
+// tables at startup.
+func TestHandleBatchRecreatesMissingTables(t *testing.T) {
+	st := newFakeStore()
+	st.failures = []error{&pgconn.PgError{Code: "42P01", Message: `relation "vm_audit_events" does not exist`}}
+	r := &fakeReader{}
+	s := newTestSink(r, st)
+
+	if err := s.handleBatch(context.Background(), []kafka.Message{createMsg(t, 4, "a")}); err != nil {
+		t.Fatal(err)
+	}
+	if st.schemaCreated != 1 || st.attempts != 2 || !st.stored["a"] {
+		t.Errorf("schema created %d times, attempts = %d, stored = %v; want once, 2 and a stored",
+			st.schemaCreated, st.attempts, st.stored)
+	}
+	if calls, maxOffset := r.committed(); calls != 1 || maxOffset != 4 {
+		t.Errorf("commits = %d up to offset %d, want 1 up to offset 4", calls, maxOffset)
+	}
+}
+
+func TestHandleBatchRecreatesMissingDeadLetterTable(t *testing.T) {
+	st := newFakeStore()
+	st.reject["bad"] = &pgconn.PgError{Code: "22P05", Message: "unsupported Unicode escape sequence"}
+	st.deadFailures = []error{&pgconn.PgError{Code: "42P01", Message: `relation "vm_audit_dead_letters" does not exist`}}
+	r := &fakeReader{}
+	s := newTestSink(r, st)
+
+	if err := s.handleBatch(context.Background(), []kafka.Message{createMsg(t, 0, "bad")}); err != nil {
+		t.Fatal(err)
+	}
+	if st.schemaCreated != 1 || len(st.dead) != 1 || st.dead[0] != "bad" {
+		t.Errorf("schema created %d times, dead-lettered %v; want once and [bad]", st.schemaCreated, st.dead)
+	}
+	if calls, maxOffset := r.committed(); calls != 1 || maxOffset != 0 {
+		t.Errorf("commits = %d up to offset %d, want 1 up to offset 0", calls, maxOffset)
 	}
 }
 
@@ -343,6 +396,29 @@ func TestIsRowError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isRowError(tt.err); got != tt.want {
 				t.Errorf("isRowError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsMissingSchema(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"undefined table", &pgconn.PgError{Code: "42P01"}, true},
+		{"undefined column", &pgconn.PgError{Code: "42703"}, true},
+		{"wrapped", errors.Join(errors.New("batch"), &pgconn.PgError{Code: "42P01"}), true},
+		{"permission denied", &pgconn.PgError{Code: "42501"}, false},
+		{"unique violation", &pgconn.PgError{Code: "23505"}, false},
+		{"network error", errors.New("connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isMissingSchema(tt.err); got != tt.want {
+				t.Errorf("isMissingSchema() = %v, want %v", got, tt.want)
 			}
 		})
 	}

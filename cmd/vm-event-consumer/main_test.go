@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -61,15 +62,17 @@ func (r *fakeReader) committed() (calls int, maxOffset int64) {
 // fingerprints already processed are duplicates, and states change through
 // plan.
 type fakeStore struct {
-	mu          sync.Mutex
-	failures    []error          // returned by the next apply calls, in order
-	down        error            // returned by every apply call when set
-	reject      map[string]error // fails any batch that contains this fingerprint
-	processed   map[string]bool
-	states      map[string]vmState
-	transitions []transition
-	dead        []int64 // offsets
-	attempts    int
+	mu            sync.Mutex
+	failures      []error          // returned by the next apply calls, in order
+	deadFailures  []error          // returned by the next deadLetter calls, in order
+	down          error            // returned by every apply call when set
+	reject        map[string]error // fails any batch that contains this fingerprint
+	processed     map[string]bool
+	states        map[string]vmState
+	transitions   []transition
+	dead          []int64 // offsets
+	attempts      int
+	schemaCreated int
 }
 
 func newFakeStore() *fakeStore {
@@ -106,7 +109,19 @@ func (s *fakeStore) apply(_ context.Context, rows []eventRow) ([]outcome, error)
 func (s *fakeStore) deadLetter(_ context.Context, msg kafka.Message, _ error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if len(s.deadFailures) > 0 {
+		err := s.deadFailures[0]
+		s.deadFailures = s.deadFailures[1:]
+		return err
+	}
 	s.dead = append(s.dead, msg.Offset)
+	return nil
+}
+
+func (s *fakeStore) createSchema(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.schemaCreated++
 	return nil
 }
 
@@ -315,8 +330,54 @@ func TestHandleBatchRetriesOutage(t *testing.T) {
 	if len(st.dead) != 0 {
 		t.Errorf("dead-lettered %v during an outage, want none", st.dead)
 	}
+	if st.schemaCreated != 0 {
+		t.Errorf("schema created %d times for an outage, want 0", st.schemaCreated)
+	}
 	if calls, maxOffset := r.committed(); calls != 1 || maxOffset != 7 {
 		t.Errorf("commits = %d up to offset %d, want 1 up to offset 7", calls, maxOffset)
+	}
+}
+
+// PostgreSQL restarted on a new, empty volume after the consumer created its
+// tables at startup.
+func TestHandleBatchRecreatesMissingTables(t *testing.T) {
+	st := newFakeStore()
+	st.failures = []error{&pgconn.PgError{Code: "42P01", Message: `relation "consumer_processed_events" does not exist`}}
+	r := &fakeReader{}
+	c := newTestConsumer(r, st)
+
+	if err := c.handleBatch(context.Background(), []kafka.Message{message(t, 3, testEvent("ADDED", "Stopped", "100"))}); err != nil {
+		t.Fatal(err)
+	}
+	if st.schemaCreated != 1 {
+		t.Errorf("schema created %d times, want once", st.schemaCreated)
+	}
+	if _, ok := st.state("team-a/vm-1"); st.attempts != 2 || !ok {
+		t.Errorf("attempts = %d, stored = %v; want the state stored on the second attempt", st.attempts, ok)
+	}
+	if len(st.dead) != 0 {
+		t.Errorf("dead-lettered %v, want none", st.dead)
+	}
+	if calls, maxOffset := r.committed(); calls != 1 || maxOffset != 3 {
+		t.Errorf("commits = %d up to offset %d, want 1 up to offset 3", calls, maxOffset)
+	}
+}
+
+func TestHandleBatchRecreatesMissingDeadLetterTable(t *testing.T) {
+	st := newFakeStore()
+	st.deadFailures = []error{&pgconn.PgError{Code: "42P01", Message: `relation "vm_event_dead_letters" does not exist`}}
+	r := &fakeReader{}
+	c := newTestConsumer(r, st)
+
+	batch := []kafka.Message{{Topic: "vm-events", Offset: 5, Key: []byte("team-a/vm-1"), Value: []byte("not json")}}
+	if err := c.handleBatch(context.Background(), batch); err != nil {
+		t.Fatal(err)
+	}
+	if st.schemaCreated != 1 || len(st.dead) != 1 || st.dead[0] != 5 {
+		t.Errorf("schema created %d times, dead-lettered %v; want once and [5]", st.schemaCreated, st.dead)
+	}
+	if calls, maxOffset := r.committed(); calls != 1 || maxOffset != 5 {
+		t.Errorf("commits = %d up to offset %d, want 1 up to offset 5", calls, maxOffset)
 	}
 }
 
@@ -488,6 +549,29 @@ func TestIsRowError(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isRowError(tt.err); got != tt.want {
 				t.Errorf("isRowError() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestIsMissingSchema(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"undefined table", &pgconn.PgError{Code: "42P01"}, true},
+		{"undefined column", &pgconn.PgError{Code: "42703"}, true},
+		{"wrapped", fmt.Errorf("apply: %w", &pgconn.PgError{Code: "42P01"}), true},
+		{"permission denied", &pgconn.PgError{Code: "42501"}, false},
+		{"unique violation", &pgconn.PgError{Code: "23505"}, false},
+		{"network error", errors.New("connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isMissingSchema(tt.err); got != tt.want {
+				t.Errorf("isMissingSchema() = %v, want %v", got, tt.want)
 			}
 		})
 	}

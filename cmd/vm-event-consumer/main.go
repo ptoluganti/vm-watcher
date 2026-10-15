@@ -120,6 +120,8 @@ type stateStore interface {
 	// It reports what each row did.
 	apply(ctx context.Context, rows []eventRow) ([]outcome, error)
 	deadLetter(ctx context.Context, msg kafka.Message, cause error) error
+	// createSchema creates whatever tables, columns and indexes are missing.
+	createSchema(ctx context.Context) error
 }
 
 // eventRow is a decoded VM event and the Kafka message it came from.
@@ -367,6 +369,7 @@ func (c *consumer) apply(ctx context.Context, rows []eventRow) ([]outcome, error
 	var outcomes []outcome
 	err := c.retry(ctx, "apply VM events", func() (err error) {
 		outcomes, err = c.store.apply(ctx, rows)
+		c.repairSchema(ctx, err)
 		return err
 	}, isRowError)
 	return outcomes, err
@@ -379,12 +382,28 @@ func (c *consumer) deadLetter(ctx context.Context, msg kafka.Message, cause erro
 		"offset", msg.Offset,
 		"err", cause)
 	err := c.retry(ctx, "dead-letter VM event", func() error {
-		return c.store.deadLetter(ctx, msg, cause)
+		err := c.store.deadLetter(ctx, msg, cause)
+		c.repairSchema(ctx, err)
+		return err
 	}, nil)
 	if err == nil {
 		messagesTotal.WithLabelValues("dead_lettered").Inc()
 	}
 	return err
+}
+
+// repairSchema recreates the tables when err says they are missing, as when
+// PostgreSQL comes back on a new, empty volume after the consumer started.
+// The failed write is then retried as usual; without the tables every retry
+// would fail the same way.
+func (c *consumer) repairSchema(ctx context.Context, err error) {
+	if !isMissingSchema(err) {
+		return
+	}
+	c.log.Warn("PostgreSQL tables are missing; creating them", "err", err)
+	if err := c.store.createSchema(ctx); err != nil {
+		c.log.Error("create schema", "err", err)
+	}
 }
 
 // retry runs op until it succeeds, ctx is done, or giveUp (when set) accepts
@@ -482,6 +501,13 @@ func isRowError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// isMissingSchema reports whether PostgreSQL says a table (SQLSTATE 42P01) or
+// column (42703) does not exist.
+func isMissingSchema(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "42703")
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
@@ -804,6 +830,10 @@ type pgStore struct {
 	pool     *pgxpool.Pool
 	consumer string        // CONSUMER_NAME, the dedupe scope in consumer_processed_events
 	maxGap   time.Duration // MAX_TRANSITION_GAP
+}
+
+func (p pgStore) createSchema(ctx context.Context) error {
+	return ensureSchema(ctx, p.pool)
 }
 
 const insertProcessedSQL = `
