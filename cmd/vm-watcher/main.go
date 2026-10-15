@@ -75,6 +75,11 @@ const (
 	// drainTimeout is how long queued events are still written after
 	// shutdown starts. It fits in the pod's 30s termination grace period.
 	drainTimeout = 10 * time.Second
+
+	// kafkaIdleTimeout is how long an unused broker connection stays open
+	// (kafka-go's default is 30s). It is just under the brokers' own
+	// connections.max.idle.ms of 10 min, so the watcher closes it first.
+	kafkaIdleTimeout = 9 * time.Minute
 )
 
 var (
@@ -190,19 +195,7 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	writer := &kafka.Writer{
-		Addr:     kafka.TCP(cfg.KafkaBrokers...),
-		Topic:    cfg.KafkaTopic,
-		Balancer: &kafka.Hash{},
-		// A whole batch fits in one produce request per partition.
-		BatchSize: cfg.BatchMaxSize,
-		// How long a partial batch waits for more messages before it is sent.
-		BatchTimeout: 5 * time.Millisecond,
-		RequiredAcks: kafka.RequireAll,
-		ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
-			log.Error("kafka: " + fmt.Sprintf(msg, args...))
-		}),
-	}
+	writer := newWriter(cfg, log)
 
 	var ready atomic.Bool
 	server := &http.Server{Addr: cfg.HTTPAddr, Handler: httpMux(&ready)}
@@ -271,6 +264,28 @@ func main() {
 	<-published
 	if err := writer.Close(); err != nil {
 		log.Error("close kafka writer", "err", err)
+	}
+}
+
+func newWriter(cfg config, log *slog.Logger) *kafka.Writer {
+	return &kafka.Writer{
+		Addr:     kafka.TCP(cfg.KafkaBrokers...),
+		Topic:    cfg.KafkaTopic,
+		Balancer: &kafka.Hash{},
+		// A whole batch fits in one produce request per partition.
+		BatchSize: cfg.BatchMaxSize,
+		// How long a partial batch waits for more messages before it is sent.
+		BatchTimeout: 5 * time.Millisecond,
+		RequiredAcks: kafka.RequireAll,
+		// Keep the broker connection open between changes. VM changes often
+		// come minutes apart, and with kafka-go's 30s default the first one
+		// after a pause had to look up the broker in DNS, connect and negotiate
+		// versions before it was written: 0.5-5 s on a busy kind node instead
+		// of about 10 ms.
+		Transport: &kafka.Transport{IdleTimeout: kafkaIdleTimeout},
+		ErrorLogger: kafka.LoggerFunc(func(msg string, args ...interface{}) {
+			log.Error("kafka: " + fmt.Sprintf(msg, args...))
+		}),
 	}
 }
 

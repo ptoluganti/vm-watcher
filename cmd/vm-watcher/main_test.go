@@ -362,6 +362,25 @@ func TestNextBatch(t *testing.T) {
 	}
 }
 
+// The writer settings that keep a lone VM change at about 10 ms to Kafka.
+func TestNewWriterLatencySettings(t *testing.T) {
+	w := newWriter(config{KafkaBrokers: []string{"broker-0:9092"}, KafkaTopic: "vm-events", BatchMaxSize: 100}, discard)
+
+	if _, ok := w.Balancer.(*kafka.Hash); !ok {
+		t.Errorf("balancer = %T, want *kafka.Hash so each VM keeps one partition", w.Balancer)
+	}
+	if w.BatchTimeout != 5*time.Millisecond || w.BatchSize != 100 || w.RequiredAcks != kafka.RequireAll {
+		t.Errorf("batch timeout %v, size %d, acks %v; want 5ms, 100, RequireAll", w.BatchTimeout, w.BatchSize, w.RequiredAcks)
+	}
+	tr, ok := w.Transport.(*kafka.Transport)
+	if !ok || tr.IdleTimeout != kafkaIdleTimeout {
+		t.Fatalf("transport = %#v, want a *kafka.Transport keeping idle connections %v", w.Transport, kafkaIdleTimeout)
+	}
+	if kafkaIdleTimeout < time.Minute || kafkaIdleTimeout >= 10*time.Minute {
+		t.Errorf("kafkaIdleTimeout = %v, want minutes but under the brokers' 10 min connections.max.idle.ms", kafkaIdleTimeout)
+	}
+}
+
 func TestParseWatchNamespaces(t *testing.T) {
 	tests := []struct {
 		in       string
