@@ -41,6 +41,8 @@ This will:
 4. Build/load `vm-audit-sink:dev`, `vm-watcher:dev` and `vm-event-consumer:dev`
 5. Install Strimzi, deploy PostgreSQL, Kafka (topics `vm-audit-raw` and `vm-events`), the audit sink, the watcher and the consumer
 
+Strimzi is pinned to 1.3.0 (`-StrimziVersion`), which runs Kafka 4.2.x and 4.3.x and serves only the `kafka.strimzi.io/v1` API. `deployment/16-kafka.yaml` names Kafka 4.3.1, so change the two together.
+
 The audit forwarder is OpenShift-only and is not applied by the script, so on kind only the live VM state lane carries data. On OpenShift (Logging 6.x), apply it separately:
 
 ```powershell
