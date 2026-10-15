@@ -50,26 +50,46 @@ kubectl apply -f deployment/04-clf.yaml
 ## The two lanes
 
 ```mermaid
-flowchart LR
-  U[User or automation] --> API[kube-apiserver]
+flowchart TB
+  user(["User or<br/>automation"]) --> api["kube-apiserver"]
 
-  subgraph live ["Live VM state lane (~0.1-0.5 s)"]
-    W[vm-watcher<br/>informer] --> K1[(Kafka<br/>vm-events)]
-    K1 --> C[vm-event-consumer]
-    C --> S[(vm_state<br/>vm_state_transitions)]
+  subgraph live ["Live VM state lane · ~0.1–0.5 s"]
+    watcher["vm-watcher<br/>(informer)"] --> eventsTopic[("Kafka topic<br/>vm-events")]
+    eventsTopic --> consumer["vm-event-<br/>consumer"]
   end
 
-  subgraph audit ["Audit lane (~1-3 s)"]
-    L[audit log file] --> F[ClusterLogForwarder<br/>VM writes only]
-    F --> K2[(Kafka<br/>vm-audit-raw)]
-    K2 --> A[audit sink]
-    A --> E[(vm_audit_events)]
+  subgraph audit ["Audit lane · ~1–3 s · OpenShift"]
+    clf["ClusterLogForwarder<br/>VM writes only"] --> auditTopic[("Kafka topic<br/>vm-audit-raw")]
+    auditTopic --> sink["audit sink"]
   end
 
-  API -- watch --> W
-  API -- audit event --> L
-  S -.-|namespace/name + resourceVersion| E
+  subgraph pg ["PostgreSQL"]
+    state[("vm_state<br/>vm_state_transitions")]
+    auditEvents[("vm_audit_events")]
+    join{{"join key:<br/>namespace/name,<br/>resourceVersion"}}
+    state -.- join
+    auditEvents -.- join
+  end
+
+  api -->|watch| watcher
+  api -->|audit log file| clf
+  consumer --> state
+  sink --> auditEvents
+
+  classDef source fill:#f3f4f6,stroke:#6b7280,color:#111827
+  classDef liveNode fill:#dbeafe,stroke:#2563eb,color:#0c1f44
+  classDef auditNode fill:#ffedd5,stroke:#c2410c,color:#431407
+  classDef joinNode fill:#f3f4f6,stroke:#6b7280,color:#111827,stroke-dasharray:4 3
+  class user,api source
+  class watcher,eventsTopic,consumer,state liveNode
+  class clf,auditTopic,sink,auditEvents auditNode
+  class join joinNode
+  style live fill:none,stroke:#2563eb,stroke-width:2px
+  style audit fill:none,stroke:#c2410c,stroke-width:2px
+  style pg fill:none,stroke:#6b7280,stroke-width:2px
 ```
+
+Blue boxes are the live VM state lane and orange boxes the audit lane. Both lanes share one Strimzi Kafka cluster and one PostgreSQL database.
 
 | | Live VM state lane | Audit lane |
 |---|---|---|
