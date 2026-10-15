@@ -197,6 +197,7 @@ Watcher:
 - A failed Kafka write is retried with backoff until Kafka acknowledges it. Nothing newer is written in the meantime, so each VM's order holds. While Kafka is down the queue fills and the informer buffers further changes in memory; nothing is dropped.
 - On start, the informer lists every VM and publishes `ADDED` for each, so the consumer converges on the current state after a restart or outage. Changes in between are not recovered by this lane; the audit lane has them.
 - On shutdown it stops the informers and keeps writing queued events for up to 10 s.
+- The connection to the broker stays open for up to 9 minutes between changes (kafka-go closes it after 30 s by default). Otherwise the first change after a pause waits for a DNS lookup, a new connection and version negotiation, which on a busy kind node took 0.5–5 s instead of about 10 ms. A change after a longer pause, and the first one after the watcher starts, still open a new connection.
 - An event over 1 MB (Kafka's default message size limit) is dropped and counted in `vm_events_dropped_total`, since it could never be written.
 - Run one replica. A second one publishes every change twice; the consumer absorbs that but gains nothing.
 
