@@ -141,6 +141,8 @@ type eventStore interface {
 	// was new (false means its auditID was already stored).
 	insertEvents(ctx context.Context, rows []eventRow) ([]bool, error)
 	deadLetter(ctx context.Context, msg kafka.Message, auditID string, cause error) error
+	// createSchema creates whatever tables, columns and indexes are missing.
+	createSchema(ctx context.Context) error
 }
 
 // eventRow is a wanted audit event and the Kafka message it came from.
@@ -368,6 +370,7 @@ func (s *sink) insert(ctx context.Context, rows []eventRow) ([]bool, error) {
 	var inserted []bool
 	err := s.retry(ctx, "insert audit events", func() (err error) {
 		inserted, err = s.store.insertEvents(ctx, rows)
+		s.repairSchema(ctx, err)
 		return err
 	}, isRowError)
 	return inserted, err
@@ -380,12 +383,28 @@ func (s *sink) deadLetter(ctx context.Context, row eventRow, cause error) error 
 		"offset", row.msg.Offset,
 		"err", cause)
 	err := s.retry(ctx, "dead-letter audit event", func() error {
-		return s.store.deadLetter(ctx, row.msg, row.ev.AuditID, cause)
+		err := s.store.deadLetter(ctx, row.msg, row.ev.AuditID, cause)
+		s.repairSchema(ctx, err)
+		return err
 	}, nil)
 	if err == nil {
 		messagesTotal.WithLabelValues("dead_lettered").Inc()
 	}
 	return err
+}
+
+// repairSchema recreates the tables when err says they are missing, as when
+// PostgreSQL comes back on a new, empty volume after the sink started. The
+// failed write is then retried as usual; without the tables every retry would
+// fail the same way.
+func (s *sink) repairSchema(ctx context.Context, err error) {
+	if !isMissingSchema(err) {
+		return
+	}
+	s.log.Warn("PostgreSQL tables are missing; creating them", "err", err)
+	if err := s.store.createSchema(ctx); err != nil {
+		s.log.Error("create schema", "err", err)
+	}
 }
 
 // retry runs op until it succeeds, ctx is done, or giveUp (when set) accepts
@@ -466,6 +485,13 @@ func isRowError(err error) bool {
 		return true
 	}
 	return false
+}
+
+// isMissingSchema reports whether PostgreSQL says a table (SQLSTATE 42P01) or
+// column (42703) does not exist.
+func isMissingSchema(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "42703")
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) bool {
@@ -658,6 +684,10 @@ func wantEvent(ev auditEvent) bool {
 
 type pgStore struct {
 	pool *pgxpool.Pool
+}
+
+func (p pgStore) createSchema(ctx context.Context) error {
+	return ensureSchema(ctx, p.pool)
 }
 
 const insertEventSQL = `

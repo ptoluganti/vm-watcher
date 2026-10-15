@@ -204,6 +204,7 @@ Consumer:
 
 - Offsets are committed only after the batch is stored, in the background every `KAFKA_COMMIT_INTERVAL`. A replay after a crash is a no-op because `eventFingerprint` is deduplicated in `consumer_processed_events`.
 - If PostgreSQL is unavailable, the consumer retries with backoff and does not move past the failed batch. (Committing a later offset would silently skip it.)
+- If its tables are missing, for example because PostgreSQL came back on a new, empty volume, the consumer creates them again and retries the batch.
 - A message that is not a usable VM event (bad JSON, no `eventFingerprint`, no namespace/name), or one PostgreSQL rejects as invalid (SQLSTATE class 22, 23 or 54), is written to `vm_event_dead_letters` with the error and the raw Kafka payload, and ingest continues.
 - **Newest wins.** An event whose resourceVersion is lower than the one stored for the VM is recorded as processed but does not change `vm_state`, and is counted as `stale`. This keeps a late duplicate, from a watcher retry or rollout, from moving a VM backwards. Kubernetes calls resourceVersions opaque, but they come from etcd's revision counter and only grow. After restoring etcd from a backup they start lower, so clear the stored versions with `UPDATE vm_state SET last_resource_version = NULL;`.
 
@@ -324,6 +325,7 @@ Request and response bodies are only stored if the cluster's APIServer audit pro
 - Offsets are committed only after the batch's VM events are stored. Commits are sent in the background every `KAFKA_COMMIT_INTERVAL`; after a crash, at most that window is replayed.
 - Duplicate event rows are prevented in PostgreSQL by `ON CONFLICT (audit_id) DO NOTHING`, so replays are harmless.
 - If PostgreSQL is unavailable, the sink retries with backoff and does not move past the failed event. (Committing a later offset would silently skip it.)
+- If its tables are missing, for example because PostgreSQL came back on a new, empty volume, the sink creates them again and retries.
 - An event PostgreSQL rejects as invalid (SQLSTATE class 22, 23 or 54, for example a `\u0000` inside JSONB) can never succeed. It is written to `vm_audit_dead_letters` with the error and the raw Kafka payload, and ingest continues.
 
 ### Low-latency ingest
