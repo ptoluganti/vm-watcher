@@ -39,10 +39,18 @@ spec:
               value: "vm-audit-sink"
             - name: KAFKA_MAX_WAIT
               value: "500ms"
+            # Offsets are committed in the background at this interval ("0" = after
+            # every batch, synchronously). Replays after a crash are deduplicated.
+            - name: KAFKA_COMMIT_INTERVAL
+              value: "1s"
+            # Upper bound on messages written per PostgreSQL round trip.
+            - name: BATCH_MAX_SIZE
+              value: "500"
             - name: HTTP_ADDR
               value: ":8080"
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: 8080
           readinessProbe:
             httpGet:
               path: /healthz
@@ -65,3 +73,19 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+---
+# Exposes /metrics (consumer lag, end-to-end event lag, batch sizes) to Prometheus.
+apiVersion: v1
+kind: Service
+metadata:
+  name: audit-sink
+  namespace: vm-watcher
+  labels:
+    app: audit-sink
+spec:
+  selector:
+    app: audit-sink
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

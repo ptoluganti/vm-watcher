@@ -1,21 +1,84 @@
-# OpenShift ClusterLogForwarder that routes kube-apiserver audit logs to Kafka.
+# OpenShift ClusterLogForwarder that sends only KubeVirt VirtualMachine write
+# requests from the kube-apiserver audit log to the Strimzi Kafka topic
+# vm-audit-raw.
 #
-# This manifest is OpenShift-specific. It requires the Red Hat OpenShift Logging
-# operator and the ClusterLogForwarder CRD. The pipeline forwards the built-in
-# audit input to the Strimzi Kafka topic vm-audit-raw.
-apiVersion: logging.openshift.io/v1
+# Filtering on the collector keeps the rest of the cluster's audit traffic
+# (reads, other resources, node auditd, OpenShift/OAuth API servers) out of
+# Kafka, so VM events never queue behind unrelated messages in the sink.
+#
+# Requirements:
+#   - Red Hat OpenShift Logging 6.x (observability.openshift.io/v1 API).
+#   - APIServer audit profile WriteRequestBodies or AllRequestBodies if you want
+#     request/response bodies stored. The filter can drop detail but never add
+#     detail the API server did not log.
+#
+# This manifest is OpenShift-specific and is not part of kustomization.yaml.
+# Apply it with: kubectl apply -f deployment/04-clf.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vm-audit-collector
+  namespace: openshift-logging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vm-audit-collector-collect-audit-logs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: collect-audit-logs
+subjects:
+  - kind: ServiceAccount
+    name: vm-audit-collector
+    namespace: openshift-logging
+---
+apiVersion: observability.openshift.io/v1
 kind: ClusterLogForwarder
 metadata:
   name: vm-audit-forwarder
   namespace: openshift-logging
 spec:
+  serviceAccount:
+    name: vm-audit-collector
+  inputs:
+    - name: kube-api-audit
+      type: audit
+      audit:
+        # VirtualMachines are CRDs, so their requests are audited by kube-apiserver.
+        sources: [kubeAPI]
+  filters:
+    - name: vm-writes-only
+      type: kubeAPIAudit
+      kubeAPIAudit:
+        omitStages: [RequestReceived, ResponseStarted]
+        rules:
+          # First matching rule wins.
+          - level: RequestResponse
+            verbs: [create, update, patch, delete, deletecollection]
+            resources:
+              # VM spec changes, plus status updates written by KubeVirt.
+              - group: kubevirt.io
+                resources: ["virtualmachines", "virtualmachines/*"]
+              # start/stop/restart/migrate go through KubeVirt's aggregated API.
+              # Only these requests name the user who started or stopped a VM.
+              - group: subresources.kubevirt.io
+                resources: ["virtualmachines", "virtualmachines/*"]
+          # Drop everything else before it reaches Kafka.
+          - level: None
   outputs:
     - name: vm-audit-kafka
       type: kafka
-      url: "tcp://vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092/vm-audit-raw"
+      kafka:
+        url: tcp://vm-audit-cluster-kafka-bootstrap.vm-watcher.svc:9092
+        topic: vm-audit-raw
+        tuning:
+          # Disk-buffered: events read before a collector restart are re-sent.
+          # The sink deduplicates them by auditID.
+          deliveryMode: AtLeastOnce
   pipelines:
     - name: vm-audit-pipeline
-      inputRefs:
-        - audit
-      outputRefs:
-        - vm-audit-kafka
+      inputRefs: [kube-api-audit]
+      filterRefs: [vm-writes-only]
+      outputRefs: [vm-audit-kafka]

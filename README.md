@@ -4,11 +4,11 @@ KubeVirt VM audit pipeline for OpenShift/Kubernetes: kube-apiserver audit logs f
 
 ## What this project includes
 
-- Go audit sink (`cmd/audit-sink`)
-- kube-apiserver audit log forwarding via OpenShift `ClusterLogForwarder`
+- Go audit sink (`main.go`, image `vm-audit-sink`)
+- kube-apiserver audit log forwarding via OpenShift `ClusterLogForwarder`, filtered to VM write requests on the collector
 - Strimzi Kafka durable buffer (`vm-audit-raw`)
-- PostgreSQL sink (`vm_audit_events` table) via `auditID` dedupe
-- Health endpoint (`/healthz`)
+- PostgreSQL sink (`vm_audit_events` table) via `auditID` dedupe, plus `vm_audit_dead_letters` for events PostgreSQL rejects
+- Health and Prometheus metrics endpoints (`/healthz`, `/metrics`)
 - Optional Grafana/Prometheus overlays if you still want them for other workloads
 
 ## Prerequisites
@@ -33,7 +33,12 @@ This will:
 3. Install ingress-nginx
 4. Build/load `vm-audit-sink:dev`
 5. Install Strimzi, deploy PostgreSQL, Kafka, and the audit sink
-6. Apply the audit forwarding manifest for OpenShift environments
+
+The audit forwarder is OpenShift-only and is not applied by the script. On OpenShift (Logging 6.x), apply it separately:
+
+```powershell
+kubectl apply -f deployment/04-clf.yaml
+```
 
 ## Design document
 
@@ -42,23 +47,71 @@ This will:
 This deployment uses an audit-log write path:
 
 1. kube-apiserver emits authoritative audit events for every mutating VM request.
-2. OpenShift `ClusterLogForwarder` forwards the audit stream to Kafka topic `vm-audit-raw`.
-3. `cmd/audit-sink` consumes Kafka with manual offset commits and filters for KubeVirt `virtualmachines` events.
+2. OpenShift `ClusterLogForwarder` (Logging 6.x) forwards only VirtualMachine write requests from the kube-apiserver audit log to Kafka topic `vm-audit-raw`. A `kubeAPIAudit` filter on the collector drops everything else (reads, other resources, node auditd, OpenShift/OAuth API servers) before it reaches Kafka.
+3. The audit sink reads Kafka in micro-batches and keeps successful `create`, `update`, `patch`, `delete` and `deletecollection` requests for `virtualmachines` in `kubevirt.io` and `subresources.kubevirt.io`. The second group carries start/stop/restart/migrate; it is the only place the user behind those actions appears (`subresource` column).
 4. PostgreSQL enforces global dedupe with `auditID` as the primary key.
 5. Kafka provides the durable replay buffer; PostgreSQL remains the queryable store.
+
+Request and response bodies are only stored if the cluster's APIServer audit profile logs them (`WriteRequestBodies` or `AllRequestBodies`); the collector filter can drop detail but never add it.
 
 ### Delivery behavior
 
 - Multiple sink replicas can share the same Kafka consumer group.
 - Kafka partitions provide parallelism; one partition is owned by one consumer at a time.
-- Manual offset commits happen only after the PostgreSQL insert succeeds.
-- Duplicate event rows are prevented in PostgreSQL by `ON CONFLICT (audit_id) DO NOTHING`.
+- Offsets are committed only after the batch's VM events are stored. Commits are sent in the background every `KAFKA_COMMIT_INTERVAL`; after a crash, at most that window is replayed.
+- Duplicate event rows are prevented in PostgreSQL by `ON CONFLICT (audit_id) DO NOTHING`, so replays are harmless.
+- If PostgreSQL is unavailable, the sink retries with backoff and does not move past the failed event. (Committing a later offset would silently skip it.)
+- An event PostgreSQL rejects as invalid (SQLSTATE class 22, 23 or 54, for example a `\u0000` inside JSONB) can never succeed. It is written to `vm_audit_dead_letters` with the error and the raw Kafka payload, and ingest continues.
 
 ### Low-latency ingest
 
-- Kafka consumer wait bound: `KAFKA_MAX_WAIT` (default `500ms`)
-- The sink pre-filters with a cheap byte search before parsing JSON.
-- The sink also filters by `objectRef.resource`, `objectRef.apiGroup`, `stage`, and HTTP status.
+- Filtering happens on the collector, so the sink never queues VM events behind the rest of the cluster's audit traffic.
+- Micro-batching: each batch is whatever is already fetched, up to `BATCH_MAX_SIZE`. A lone event is written immediately; under load the batches grow instead of a backlog. One batch is one PostgreSQL round trip.
+- `KAFKA_MAX_WAIT` is the broker long-poll timeout while the topic is idle. It does not delay new messages.
+- The sink still pre-filters with a cheap byte search and checks `stage`, verb, `objectRef.resource`, `objectRef.apiGroup` and HTTP status, so it also works with an unfiltered forwarder.
+
+### Sink settings
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `POSTGRES_DSN` | required | PostgreSQL connection string |
+| `KAFKA_BROKERS` | required | Comma-separated bootstrap brokers |
+| `KAFKA_TOPIC` | `vm-audit-raw` | Topic to consume |
+| `KAFKA_GROUP_ID` | `vm-audit-sink` | Consumer group shared by all replicas |
+| `KAFKA_MAX_WAIT` | `500ms` | Broker long-poll timeout while idle |
+| `KAFKA_COMMIT_INTERVAL` | `1s` | Background offset commit interval; `0` commits synchronously after every batch |
+| `BATCH_MAX_SIZE` | `500` | Most messages handled per batch |
+| `RETRY_INITIAL_BACKOFF` | `200ms` | First wait after a failed PostgreSQL write; doubles on each retry |
+| `RETRY_MAX_BACKOFF` | `10s` | Longest wait between retries |
+| `HTTP_ADDR` | `:8080` | Address for `/healthz` and `/metrics` |
+
+### Measuring latency
+
+`/metrics` (scraped by the `audit-sink` job in `06-prometheus-config.yaml`) exposes:
+
+| Metric | What it shows |
+|---|---|
+| `audit_sink_event_lag_seconds` | Histogram: API server finished the request (`stageTimestamp`) → row stored |
+| `audit_sink_consumer_lag_messages{partition}` | Messages behind the newest one in each partition, as of the last handled message |
+| `audit_sink_messages_total{result}` | `stored`, `duplicate`, `filtered`, `malformed`, `dead_lettered` |
+| `audit_sink_batch_size` | Messages per batch |
+| `audit_sink_write_retries_total` | PostgreSQL writes that failed and were retried; rising means ingest is stalled |
+
+p95 end-to-end latency in PromQL:
+
+```promql
+histogram_quantile(0.95, sum by (le) (rate(audit_sink_event_lag_seconds_bucket[5m])))
+```
+
+The same from PostgreSQL (assumes control-plane and database clocks are in sync via NTP):
+
+```sql
+SELECT percentile_cont(0.5)  WITHIN GROUP (ORDER BY created_at - stage_timestamp) AS p50,
+       percentile_cont(0.95) WITHIN GROUP (ORDER BY created_at - stage_timestamp) AS p95,
+       max(created_at - stage_timestamp) AS worst
+FROM vm_audit_events
+WHERE created_at > now() - interval '1 hour';
+```
 
 ## PostgreSQL persistence, backup, and restore
 
